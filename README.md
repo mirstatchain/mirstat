@@ -18,31 +18,31 @@ The protocol is designed around fairness, predictable monetary issuance, and equ
 
 # Key Features
 
-  - Post-Quantum Vision
+Post-Quantum Vision
   - Designed with future cryptographic evolution in mind.
   - Focused on long-term security and protocol adaptability.
 
-  - Peer-to-Peer Electronic Cash
+Peer-to-Peer Electronic Cash
   - Fast and decentralized value transfer.
   - No central authority.
   - Permissionless transactions.
 
-  - Hybrid Proof-of-Work
+Hybrid Proof-of-Work
   - Independent CPU and GPU mining.
   - Encourages broader participation.
   - Reduces mining centralization.
 
-  - CPU Mining
+CPU Mining
   - Powered by **RandomX**.
   - Optimized for modern processors.
   - Resistant to ASIC domination.
 
-  - GPU Mining
+GPU Mining
   - Powered by **BLAKE3**.
   - High-performance parallel hashing.
   - Efficient on modern graphics hardware.
 
-  - Fully Decentralized
+Fully Decentralized
   - Open-source.
   - Community-driven.
   - Transparent development.
