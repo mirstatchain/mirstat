@@ -248,7 +248,7 @@ Required software:
 # Clone Repository
 
 ```bash
-git clone https://github.com/<your-org>/mirstat.git
+git clone https://github.com/mirstatchain/mirstat.git
 
 cd mirstat
 ```
@@ -288,7 +288,7 @@ Open **Developer Command Prompt for Visual Studio 2022**.
 Clone the repository:
 
 ```cmd
-git clone https://github.com/<your-org>/mirstat.git
+git clone https://github.com/mirstatchain/mirstat.git
 
 cd mirstat
 ```
