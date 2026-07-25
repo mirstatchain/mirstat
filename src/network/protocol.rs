@@ -1,0 +1,708 @@
+//! # Wire-format frame property
+//!
+//! This module defines the [`Message`] enum that is bincode-encoded over
+//! the `/mirstat/2.0.0` libp2p stream. The chat-v2 introduction (see
+//! [`crate::node`]) appends one new variant — [`Message::ChatV2`] — to
+//! this enum. The placement is **load-bearing**: every other variant
+//! retains its source-order discriminant, so its bincode encoding is
+//! byte-identical before and after the chat-v2 change.
+//!
+//! ## Discriminant table (frozen)
+//!
+//! | Index | Variant            |
+//! |------:|--------------------|
+//! |   0   | `Transaction`      |
+//! |   1   | `StemTransaction`  |
+//! |   2   | `Batch`            |
+//! |   3   | `GetState`         |
+//! |   4   | `StateInfo`        |
+//! |   5   | `GetAddr`          |
+//! |   6   | `Addr`             |
+//! |   7   | `Ping`             |
+//! |   8   | `Pong`             |
+//! |   9   | `GetBatches`       |
+//! |  10   | `Batches`          |
+//! |  11   | `GetHeaders`       |
+//! |  12   | `Headers`          |
+//! |  13   | `MixAnnounce`      |
+//! |  14   | `MixJoin`          |
+//! |  15   | `MixFee`           |
+//! |  16   | `MixProposal`      |
+//! |  17   | `MixSign`          |
+//! |  18   | `Chat`             |
+//! |  19   | `ChatV2`           |
+//!
+//! ## Theorem (ChatOnly frame)
+//!
+//! For every variant `V ∈ {Transaction … Chat}` and every value `v : V`,
+//! `bincode_encode_after_v2(v) = bincode_encode_before_v2(v)`. Proof:
+//! bincode encodes an enum variant as the varint of its source-order
+//! index followed by each field encoded in declaration order. The first
+//! 19 source-order indices and all corresponding field types are
+//! unchanged; therefore the encoded bytes are unchanged. ∎
+//!
+//! **Do not modify the order of variants in [`Message`].** Append-only.
+//!
+//! ## Cross-version compatibility
+//!
+//! - Old node → new node: every variant decodes identically;
+//!   [`Message::Chat`] continues to be accepted and is bridged to the
+//!   v2 ingest path with empty attachments.
+//! - New node → old node: variants 0..=18 decode identically; the new
+//!   [`Message::ChatV2`] (index 19) causes a bincode `InvalidTagEncoding`
+//!   error, which `deserialize_bin` surfaces as `Err` and the receiver
+//!   drops the message. No panic, no DoS, no state pollution.
+use crate::core::{Batch, BatchHeader, Transaction};
+use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use libp2p::StreamProtocol;
+use serde::{Deserialize, Serialize};
+use std::io;
+use async_trait::async_trait;
+
+pub const MAX_GETBATCHES_COUNT: u64 = 1000;  // heavy, OOM risk
+pub const MAX_GETHEADERS_COUNT: u64 = 5000; // lightweight, ~1.6MB max
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Message {
+    Transaction(Transaction),
+    /// Dandelion++ stem phase: forward to one random peer before broadcast.
+    /// When a node originates a tx, it sends it as StemTransaction to ONE peer.
+    /// Each hop has a 10% chance to "fluff" (broadcast normally). After ~10 hops
+    /// on average, or a 30-second timeout, the tx enters the public mempool.
+    StemTransaction(Transaction),
+    Batch(Batch),
+    GetState,
+    StateInfo {
+        height: u64,
+        depth: u128,
+        mirstat: [u8; 32],
+    },
+    GetAddr,
+    /// Peer exchange: list of multiaddr strings peers can dial
+    Addr(Vec<String>),
+    Ping { nonce: u64 },
+    Pong { nonce: u64 },
+    GetBatches {
+        start_height: u64,
+        count: u64,
+    },
+    Batches {
+        start_height: u64,
+        batches: Vec<Batch>,
+    },
+    /// Request headers-only to verify PoW quickly
+    GetHeaders {
+        start_height: u64,
+        count: u64,
+    },
+    /// Response with headers
+    Headers {
+        start_height: u64,
+        headers: Vec<BatchHeader>,
+    },
+    // ── Dark Pool CoinJoin ──────────────────────────────────────────
+    /// Announce intent to mix a specific denomination.
+    MixAnnounce {
+        mix_id: [u8; 32],
+        denomination: u64,
+    },
+    /// Join an announced mix session with input and desired output.
+    MixJoin {
+        mix_id: [u8; 32],
+        input: crate::core::InputReveal,
+        output: crate::core::OutputData,
+        signature: Vec<u8>,
+        join_nonce: u64,
+    },
+    MixFee {
+        mix_id: [u8; 32],
+        input: crate::core::InputReveal,
+        join_nonce: u64,
+    },
+    /// Broadcast the canonical proposal so all participants can sign.
+    MixProposal {
+        mix_id: [u8; 32],
+        inputs: Vec<crate::core::InputReveal>,
+        outputs: Vec<crate::core::OutputData>,
+        salt: [u8; 32],
+        commitment: [u8; 32],
+    },
+    /// A participant's signature for their input in the mix.
+    MixSign {
+        mix_id: [u8; 32],
+        /// Index into the proposal's canonical input list.
+        input_index: usize,
+        signature: Vec<u8>,
+    },
+    /// Legacy chat variant (discriminant 18). **Receive-only on nodes
+    /// that have adopted chat v2.** New nodes never emit this variant;
+    /// they emit [`Message::ChatV2`]. Old nodes still emit and accept
+    /// this variant, so during the upgrade window legacy peers continue
+    /// to chat with each other.
+    ///
+    /// PoW verification uses [`crate::node::verify_chat_pow`] (v1).
+    ///
+    /// On receipt by a new node, the handler bridges into the v2 ingest
+    /// path with empty attachments and re-emits as [`Message::ChatV2`].
+    Chat {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+    },
+    /// Chat with optional structured attachments (discriminant 19).
+    ///
+    /// # Why this variant exists at the end of the enum
+    ///
+    /// Appending preserves the bincode discriminant of every prior
+    /// variant. See the module-level "Wire-format frame property"
+    /// section. Reordering or inserting elsewhere would shift
+    /// discriminants and break the entire `/mirstat/2.0.0` protocol —
+    /// not just chat.
+    ///
+    /// # Validation
+    ///
+    /// Enforced in [`Message::deserialize_bin`]:
+    ///
+    /// ```text
+    /// #sender_bytes ≤ 128
+    /// isValidPeerId(sender)
+    /// #words ≤ 10
+    /// #attachments ≤ crate::node::MAX_CHAT_ATTACHMENTS  (= 4)
+    /// ```
+    ///
+    /// The 32-byte length of each `ChatAttachment::Address` is enforced
+    /// structurally by bincode: `[u8; 32]` is a fixed-length array.
+    ///
+    /// # PoW
+    ///
+    /// Verified with [`crate::node::verify_chat_pow_v2`]. Domain-separated
+    /// from v1 (Lemma 2.3.1).
+    ///
+    /// # Old-node behavior
+    ///
+    /// Receivers running pre-v2 code fail bincode with `InvalidTagEncoding`
+    /// on the unknown discriminant 19; `deserialize_bin` returns `Err`
+    /// and the message is dropped without side effects.
+    ChatV2 {
+        sender: String,
+        timestamp: u64,
+        nonce: u64,
+        reply_to: Option<u64>,
+        words: Vec<u8>,
+        attachments: Vec<crate::node::ChatAttachment>,
+    },
+}
+
+
+
+impl Message {
+    pub fn serialize_bin(&self) -> Vec<u8> {
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_MSG_SIZE as u64)
+            .serialize(self)
+            .expect("Serialization failed")
+    }
+
+pub fn deserialize_bin(bytes: &[u8]) -> anyhow::Result<Self> {
+    use bincode::Options;
+    let msg: Message = bincode::DefaultOptions::new()
+        .with_limit(MAX_MSG_SIZE as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)?;
+
+        // Post-deserialization bounds check: reject messages with
+        // unreasonably large collections that survived bincode's byte limit.
+        match &msg {
+            Message::Headers { headers, .. } => {
+                if headers.len() > MAX_GETHEADERS_COUNT as usize {
+                    anyhow::bail!("Headers count {} exceeds max {}", headers.len(), MAX_GETHEADERS_COUNT);
+                }
+            }
+            Message::Batches { batches, .. } => {
+                if batches.len() > MAX_GETBATCHES_COUNT as usize {
+                    anyhow::bail!("Batches count {} exceeds max {}", batches.len(), MAX_GETBATCHES_COUNT);
+                }
+            }
+            Message::Addr(addrs) => {
+                if addrs.len() > 1000 {
+                    anyhow::bail!("Addr count {} exceeds max 1000", addrs.len());
+                }
+            }
+            Message::Chat { sender, words, .. } => {
+                // 1. Length check
+                if sender.len() > 128 {
+                    anyhow::bail!("Chat sender too long: {}", sender.len());
+                }
+                // 2. CRYPTO CHECK: Ensure the string is an actual base58 encoded PeerId
+                if sender.parse::<libp2p::PeerId>().is_err() {
+                    anyhow::bail!("Chat sender must be a valid cryptographic PeerId");
+                }
+                // 3. Word count check
+                if words.len() > 10 {
+                    anyhow::bail!("Chat words count {} exceeds max 10", words.len());
+                }
+            }
+            Message::ChatV2 { sender, words, attachments, .. } => {
+                if sender.len() > 128 {
+                    anyhow::bail!("ChatV2 sender too long: {}", sender.len());
+                }
+                // FIX: Accept either a valid libp2p PeerId OR a 64-char hex string (MSS Identity)
+                if sender.parse::<libp2p::PeerId>().is_err() && (sender.len() != 64 || hex::decode(sender).is_err()) {
+                    anyhow::bail!("ChatV2 sender must be a valid cryptographic PeerId or a 64-hex MSS Pubkey");
+                }
+                if words.len() > 10 {
+                    anyhow::bail!("ChatV2 words count {} exceeds max 10", words.len());
+                }
+                if attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+                    anyhow::bail!(
+                        "ChatV2 attachments count {} exceeds max {}",
+                        attachments.len(),
+                        crate::node::MAX_CHAT_ATTACHMENTS,
+                    );
+                }
+                if attachments.iter().any(|att| att.is_graffiti()) {
+                    anyhow::bail!("ChatV2 attachments contain invalid data (possible text graffiti)");
+                }
+                
+                // SECURITY: Cap dynamic signature attachments to the maximum valid crypto signature size
+                for att in attachments {
+                    if let crate::node::ChatAttachment::Signature(sig) = att {
+                        if sig.len() > crate::core::MAX_SIGNATURE_SIZE {
+                            anyhow::bail!("ChatV2 signature attachment exceeds MAX_SIGNATURE_SIZE (1536 bytes)");
+                        }
+                    }
+                }
+            }          
+            _ => {}
+        }
+
+        Ok(msg)
+    }
+}
+
+// ── libp2p request-response codec ───────────────────────────────────────────
+pub const mirstat_PROTOCOL: StreamProtocol = StreamProtocol::new("/mirstat/2.0.0");
+const MAX_MSG_SIZE: usize = 10_000_000;
+
+#[derive(Debug, Clone, Default)]
+pub struct mirstatCodec;
+
+#[async_trait]
+impl libp2p::request_response::Codec for mirstatCodec {
+    type Protocol = StreamProtocol;
+    type Request = Message;
+    type Response = Message;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_message(io).await
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        read_message(io).await
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        req: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_message(io, &req).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        res: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        write_message(io, &res).await
+    }
+}
+
+async fn read_message<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<Message> {
+    let read_future = async {
+        let mut len_bytes = [0u8; 4];
+        io.read_exact(&mut len_bytes).await?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > MAX_MSG_SIZE {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+        }
+        
+        let initial_alloc = std::cmp::min(len, 65_536);
+        let mut buf = Vec::with_capacity(initial_alloc);
+        let mut handle = io.take(len as u64);
+        handle.read_to_end(&mut buf).await?;
+        
+        if buf.len() != len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete message"));
+        }
+        
+        match std::panic::catch_unwind(|| Message::deserialize_bin(&buf)) {
+            Ok(result) => result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "malformed message caused allocation panic")),
+        }
+    };
+
+    // Enforce a hard 60-second deadline to read the payload
+    tokio::time::timeout(std::time::Duration::from_secs(60), read_future)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Stream read timed out"))?
+}
+
+async fn write_message<T: AsyncWrite + Unpin + Send>(io: &mut T, msg: &Message) -> io::Result<()> {
+    let bytes = msg.serialize_bin();
+    let len = (bytes.len() as u32).to_le_bytes();
+    io.write_all(&len).await?;
+    io.write_all(&bytes).await?;
+    io.close().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_serialize_deserialize_transaction() {
+        let tx = Transaction::Commit {
+            commitment: [0xAA; 32],
+            spam_nonce: 42,
+        };
+        let msg = Message::Transaction(tx);
+        let bytes = msg.serialize_bin();
+        let msg2 = Message::deserialize_bin(&bytes).unwrap();
+        match msg2 {
+            Message::Transaction(Transaction::Commit {
+                commitment,
+                spam_nonce,
+            }) => {
+                assert_eq!(commitment, [0xAA; 32]);
+                assert_eq!(spam_nonce, 42);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn message_serialize_deserialize_state_info() {
+        let msg = Message::StateInfo {
+            height: 31000,
+            depth: 5000,
+            mirstat: [0xBB; 32],
+        };
+        let bytes = msg.serialize_bin();
+        let msg2 = Message::deserialize_bin(&bytes).unwrap();
+        match msg2 {
+            Message::StateInfo {
+                height,
+                depth,
+                mirstat,
+            } => {
+                assert_eq!(height, 31000);
+                assert_eq!(depth, 5000);
+                assert_eq!(mirstat, [0xBB; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn message_serialize_deserialize_get_batches() {
+        let msg = Message::GetBatches {
+            start_height: 50,
+            count: 20,
+        };
+        let bytes = msg.serialize_bin();
+        let msg2 = Message::deserialize_bin(&bytes).unwrap();
+        match msg2 {
+            Message::GetBatches {
+                start_height,
+                count,
+            } => {
+                assert_eq!(start_height, 50);
+                assert_eq!(count, 20);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn message_deserialize_garbage_fails() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC];
+        assert!(Message::deserialize_bin(&garbage).is_err());
+    }
+
+    #[test]
+    fn message_all_variants_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
+        let messages = vec![
+            Message::GetState,
+            Message::GetAddr,
+            Message::Ping { nonce: 12345 },
+            Message::Pong { nonce: 54321 },
+            Message::Addr(vec![
+                "/ip4/203.0.113.10/tcp/9333/p2p/12D3KooWTest".to_string(),
+                "/ip4/10.0.0.1/udp/9333/quic-v1/p2p/12D3KooWOther".to_string(),
+            ]),
+            Message::GetBatches {
+                start_height: 0,
+                count: 100,
+            },
+            Message::Batches {
+                start_height: 0,
+                batches: vec![],
+            },
+            Message::GetHeaders {
+                start_height: 0,
+                count: 50,
+            },
+            Message::Headers {
+                start_height: 0,
+                headers: vec![],
+            },
+            Message::MixAnnounce {
+                mix_id: [0; 32],
+                denomination: 8,
+            },
+            Message::MixJoin {
+                mix_id: [0; 32],
+                input: InputReveal {
+                    predicate: Predicate::p2pk(&[1; 32]),
+                    value: 8,
+                    salt: [2; 32],
+                    commitment: None,
+                },
+                output: OutputData::Standard {
+                    address: [3; 32],
+                    value: 8,
+                    salt: [4; 32],
+                },
+                signature: vec![],
+                join_nonce: 0,
+            },
+            Message::MixProposal {
+                mix_id: [0; 32],
+                inputs: vec![],
+                outputs: vec![],
+                salt: [0; 32],
+                commitment: [0; 32],
+            },
+            Message::MixSign {
+                mix_id: [0; 32],
+                input_index: 0,
+                signature: vec![],
+            },
+            Message::Chat {
+                sender: "12D3KooWTest".to_string(),
+                timestamp: 0,
+                nonce: 12345,
+                reply_to: None,
+                words: vec![1, 5, 20],
+            },
+        ];
+
+        for msg in messages {
+            let bytes = msg.serialize_bin();
+            assert!(Message::deserialize_bin(&bytes).is_ok());
+        }
+    }
+
+    // ── PEX message tests ───────────────────────────────────────────
+    #[test]
+    fn addr_message_preserves_multiaddr_strings() {
+        let addrs = vec![
+            "/ip4/1.2.3.4/tcp/9333/p2p/12D3KooWAbCdEf".to_string(),
+            "/ip4/5.6.7.8/udp/9333/quic-v1/p2p/12D3KooWGhIjKl".to_string(),
+            "/ip4/10.0.0.1/tcp/9333/p2p/12D3KooWRelay/p2p-circuit/p2p/12D3KooWNatted".to_string(),
+        ];
+        let msg = Message::Addr(addrs.clone());
+        let bytes = msg.serialize_bin();
+        let msg2 = Message::deserialize_bin(&bytes).unwrap();
+        match msg2 {
+            Message::Addr(got) => assert_eq!(got, addrs),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn addr_message_empty_vec() {
+        let msg = Message::Addr(vec![]);
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::Addr(addrs) => assert!(addrs.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── CoinJoin dark pool messages ─────────────────────────────────
+    #[test]
+    fn mix_announce_round_trip() {
+        let msg = Message::MixAnnounce {
+            mix_id: [0xAA; 32],
+            denomination: 16,
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixAnnounce { mix_id, denomination } => {
+                assert_eq!(mix_id, [0xAA; 32]);
+                assert_eq!(denomination, 16);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_join_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
+        let msg = Message::MixJoin {
+            mix_id: [0xBB; 32],
+            input: InputReveal {
+                predicate: Predicate::p2pk(&[1; 32]),
+                value: 8,
+                salt: [2; 32],
+                commitment: None,
+            },
+            output: OutputData::Standard {
+                address: [3; 32],
+                value: 8,
+                salt: [4; 32],
+            },
+            signature: vec![0xDD; 576],
+            join_nonce: 42,
+        };
+
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixJoin { mix_id, input, output, signature, join_nonce } => {
+                assert_eq!(mix_id, [0xBB; 32]);
+                assert_eq!(input.value, 8);
+                assert_eq!(output.value(), 8);
+                assert_eq!(signature.len(), 576);
+                assert_eq!(join_nonce, 42);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_proposal_round_trip() {
+        use crate::core::types::{InputReveal, OutputData};
+        use crate::core::types::Predicate;
+
+        let msg = Message::MixProposal {
+            mix_id: [0xCC; 32],
+            inputs: vec![
+                InputReveal {
+                    predicate: Predicate::p2pk(&[1; 32]),
+                    value: 8,
+                    salt: [2; 32],
+                    commitment: None,
+                },
+                InputReveal {
+                    predicate: Predicate::p2pk(&[3; 32]),
+                    value: 1,
+                    salt: [4; 32],
+                    commitment: None,
+                },
+            ],
+            outputs: vec![OutputData::Standard {
+                address: [5; 32],
+                value: 8,
+                salt: [6; 32],
+            }],
+            salt: [0xDD; 32],
+            commitment: [0xEE; 32],
+        };
+
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixProposal {
+                mix_id,
+                inputs,
+                outputs,
+                salt,
+                commitment,
+            } => {
+                assert_eq!(mix_id, [0xCC; 32]);
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(salt, [0xDD; 32]);
+                assert_eq!(commitment, [0xEE; 32]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn mix_sign_round_trip() {
+        let msg = Message::MixSign {
+            mix_id: [0xFF; 32],
+            input_index: 2,
+            signature: vec![0xAB; 576],
+        };
+        let bytes = msg.serialize_bin();
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::MixSign {
+                mix_id,
+                input_index,
+                signature,
+            } => {
+                assert_eq!(mix_id, [0xFF; 32]);
+                assert_eq!(input_index, 2);
+                assert_eq!(signature.len(), 576);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn addr_message_large_peer_list() {
+        // PEX should handle up to ~1000 addrs without hitting MAX_MSG_SIZE
+        let addrs: Vec<String> = (0..1000)
+            .map(|i| {
+                format!(
+                    "/ip4/10.{}.{}.{}/tcp/9333/p2p/12D3KooWTest{}",
+                    i / 65536,
+                    (i / 256) % 256,
+                    i % 256,
+                    i
+                )
+            })
+            .collect();
+        let msg = Message::Addr(addrs.clone());
+        let bytes = msg.serialize_bin();
+        assert!(bytes.len() < MAX_MSG_SIZE);
+        match Message::deserialize_bin(&bytes).unwrap() {
+            Message::Addr(got) => assert_eq!(got.len(), 1000),
+            _ => panic!("wrong variant"),
+        }
+    }
+}

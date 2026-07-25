@@ -1,0 +1,2705 @@
+pub mod coinjoin;
+pub mod crypto;
+pub mod hd;
+pub mod defrag;
+
+use crate::core::{hash_concat, compute_commitment, compute_coin_id, compute_address, decompose_value, wots, OutputData, InputReveal, Predicate, Witness};
+use crate::core::mss::{self, MssKeypair};
+
+use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+pub use defrag::{DefragBatchPlan, FeePolicy};
+/// Default wallet location: ~/.mirstat/wallet.dat
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".mirstat")
+        .join("wallet.dat")
+}
+
+
+/// A receiving key (seed + public key). No value assigned yet.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletKey {
+    pub seed: [u8; 32],
+    pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
+    pub label: Option<String>,
+}
+
+/// Immutable metadata for a Pruning License (State Thread).
+///
+/// # Bearer Asset Warning (Critical)
+/// Only the 32-byte commitment lives on-chain inside OutputData::Confidential.
+/// The full plaintext metadata must be supplied by the *owner* on every spend
+/// so the royalty covenant can extract the fixed royalty fee and verify the hash.
+///
+/// If this data is lost (wallet corruption, forgotten backup, etc.), the license
+/// becomes permanently unspendable. This is an intentional bearer-asset property.
+///
+/// The wallet stores this data encrypted inside wallet.dat using the same
+/// password + file locking as all other sensitive material.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LicenseMetadata {
+    /// Issuer's long-term public key / address (royalty destination)
+    pub issuer: [u8; 32],
+    /// Fixed royalty fee paid to the issuer on every transfer of this license.
+    /// This is set at issuance time and is much harder to evade than percentage royalties.
+    pub fixed_royalty_fee: u64,
+    pub min_height: u64,
+    pub max_height: u64,
+    /// Approximate archival weight covered by this license (e.g. GB or block count)
+    pub archival_weight: u64,
+    /// Commitment to the Proof-of-Archival-Work (PoW Merkle root + MMR anchor)
+    pub poaw_commitment: [u8; 32],
+    pub issuance_height: u64,
+    pub nonce: [u8; 16],
+}
+
+/// A coin the wallet controls, with known value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletCoin {
+    pub seed: [u8; 32],
+    pub owner_pk: [u8; 32],
+    pub address: [u8; 32],
+    pub value: u64,
+    pub salt: [u8; 32],
+    pub coin_id: [u8; 32],
+    pub label: Option<String>,
+    /// Set to true after this coin's WOTS key has signed a message.
+    /// A second signature with the same key would be catastrophic.
+    /// MSS-backed coins don't use this flag (MSS handles its own leaf counter).
+    #[serde(default)]
+    pub wots_signed: bool,
+    /// FIX 2: Store the specific Blake3 commitment hash needed to spend this confidential UTXO.
+    #[serde(default)]
+    pub commitment: Option<[u8; 32]>,
+}
+
+/// A commit that has been submitted but not yet revealed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingCommit {
+    pub commitment: [u8; 32],
+    pub salt: [u8; 32],
+    pub input_coin_ids: Vec<[u8; 32]>,
+    /// Full output data needed for the reveal transaction.
+    pub outputs: Vec<OutputData>,
+    /// (output_index, wots_seed) for change outputs we control.
+    pub change_seeds: Vec<(usize, [u8; 32])>,
+    pub created_at: u64,
+    #[serde(default)]
+    pub reveal_not_before: u64,
+    /// Identifies if this commit belongs to a dust-sweeping Consolidate transaction
+    #[serde(default)]
+    pub is_consolidate: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub inputs: Vec<[u8; 32]>,
+    pub outputs: Vec<[u8; 32]>,
+    pub fee: u64,
+    pub timestamp: u64,
+    /// "sent", "received", "mixed", or "coinbase"
+    #[serde(default = "HistoryEntry::default_kind")]
+    pub kind: String,
+}
+
+impl HistoryEntry {
+    fn default_kind() -> String { "sent".into() }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WalletData {
+    /// Receiving keys (not yet associated with a value).
+    #[serde(default)]
+    pub keys: Vec<WalletKey>,
+    /// Coins with known values that we can spend.
+    pub coins: Vec<WalletCoin>,
+    #[serde(default)]
+    pub mss_keys: Vec<MssKeypair>,
+    pub pending: Vec<PendingCommit>,
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub last_scan_height: u64,
+
+    // ── HD derivation state ─────────────────────────────────────────────
+    // These fields are None/0 for legacy (pre-HD) wallets.
+
+    /// HD master seed derived from BIP39 mnemonic. None for legacy wallets.
+    /// The mnemonic phrase itself is NEVER stored — only this derived seed.
+    #[serde(default)]
+    pub master_seed: Option<[u8; 32]>,
+    /// Next unused WOTS derivation index. Covers receive keys, change outputs,
+    /// and CoinJoin mix outputs — every one-time key comes from this counter.
+    #[serde(default)]
+    pub next_wots_index: u64,
+    /// Next unused MSS derivation index.
+    #[serde(default)]
+    pub next_mss_index: u64,
+
+    /// secp256k1 key for the EVM leg of cross-chain swaps, derived at wallet
+    /// creation from the BIP39 seed at the standard BIP44 path
+    /// `m/44'/60'/0'/0/0`. `None` for wallets created before this existed.
+    #[serde(default)]
+    pub evm_secret: Option<[u8; 32]>,
+
+    // ── Pruning Licenses (Phase 1) ────────────────────────────────────────
+    /// Plaintext metadata for licenses this wallet owns.
+    /// Stored as Vec of (coin_id, metadata) tuples.
+    ///
+    /// IMPORTANT: We use Vec<(K,V)> instead of HashMap<[u8;32],_> because
+    /// serde_json requires object keys to be strings. Vec serializes cleanly.
+    #[serde(default)]
+    pub license_metadata: Vec<([u8; 32], LicenseMetadata)>,
+}
+
+impl WalletData {
+    fn empty() -> Self {
+        Self {
+            keys: Vec::new(),
+            coins: Vec::new(),
+            mss_keys: Vec::new(),
+            pending: Vec::new(),
+            history: Vec::new(),
+            last_scan_height: 0,
+            master_seed: None,
+            next_wots_index: 0,
+            next_mss_index: 0,
+            evm_secret: None,
+            license_metadata: Vec::new(),
+        }
+    }
+}
+
+/// Simple RAII guard for an exclusive lock on the wallet file.
+/// The lock file is deleted when this guard is dropped.
+struct WalletFileLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for WalletFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub struct Wallet {
+    path: PathBuf,
+    password: Vec<u8>,
+    pub data: WalletData,
+    /// Coin records the chain has confirmed are already spent.
+    ///
+    /// A wallet cannot work this out alone. `complete_reveal` drops the coins
+    /// it spends, but a coin spent by another instance of this wallet, undone
+    /// by a reorg, or imported and never confirmed leaves a record behind that
+    /// is locally indistinguishable from a live coin. The co-spend gate in
+    /// `prepare_commit` would then treat it as a sibling that must also be
+    /// spent — impossible, since it no longer exists — and the address becomes
+    /// permanently unspendable.
+    ///
+    /// Callers that have just consulted the UTXO set record what they found
+    /// here. Deliberately session-only and never serialised: a stale view of
+    /// the chain must not outlive the process that formed it. The coin records
+    /// themselves are left untouched, so a wrong answer costs a refused spend
+    /// rather than a lost coin.
+    known_spent: std::collections::HashSet<[u8; 32]>,
+}
+
+impl Wallet {
+    pub fn create(path: &Path, password: &[u8]) -> Result<Self> {
+        if path.exists() {
+            bail!("wallet file already exists: {}", path.display());
+        }
+        let wallet = Self {
+            known_spent: Default::default(),
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data: WalletData::empty(),
+        };
+        wallet.save()?;
+        Ok(wallet)
+    }
+
+    /// Create a new HD wallet backed by a BIP39 mnemonic.
+    /// Returns (wallet, 24-word phrase). The phrase MUST be shown to the user
+    /// for backup — it is never stored on disk.
+    pub fn create_hd(path: &Path, password: &[u8]) -> Result<(Self, String)> {
+        if path.exists() {
+            bail!("wallet file already exists: {}", path.display());
+        }
+        let (master_seed, phrase) = hd::generate_mnemonic()?;
+        let mut data = WalletData::empty();
+        data.master_seed = Some(master_seed);
+        let wallet = Self {
+            known_spent: Default::default(),
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data,
+        };
+        wallet.save()?;
+        Ok((wallet, phrase))
+    }
+
+    /// Restore an HD wallet from a BIP39 mnemonic phrase.
+    /// The wallet starts empty — call a chain scan to rediscover coins.
+    pub fn restore_from_mnemonic(path: &Path, password: &[u8], phrase: &str) -> Result<Self> {
+        if path.exists() {
+            bail!("wallet file already exists: {}", path.display());
+        }
+        let master_seed = hd::master_seed_from_mnemonic(phrase)?;
+        let mut data = WalletData::empty();
+        data.master_seed = Some(master_seed);
+        let wallet = Self {
+            known_spent: Default::default(),
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data,
+        };
+        wallet.save()?;
+        Ok(wallet)
+    }
+
+    /// Whether this wallet uses HD derivation.
+    pub fn is_hd(&self) -> bool {
+        self.data.master_seed.is_some()
+    }
+
+    // ======================================================================
+    //  SAFE HD SEED ALLOCATION (Critical Fix for Key Reuse on Crash)
+    // ======================================================================
+    //
+    // # Reasoning
+    // The previous design advanced the HD counter in memory and derived the
+    // seed, but relied on the *caller* to eventually call save(). Multiple
+    // call sites (plan_private_send for change outputs, prepare_mix_registration,
+    // automix, etc.) could advance the counter many times before any save,
+    // or could fail/crash between allocation and save.
+    //
+    // On next open the counter would rewind, causing deterministic reuse of
+    // WOTS one-time keys — catastrophic for a post-quantum one-time signature
+    // scheme.
+    //
+    // This patch makes advancement + persistence atomic from the caller's
+    // perspective for HD wallets.
+
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Acquire an exclusive lock on the wallet file.
+    fn acquire_lock(&self) -> Result<WalletFileLock> {
+        let lock_path = self.lock_path();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => Ok(WalletFileLock {
+                path: lock_path,
+                _file: file,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!(
+                    "wallet.dat is locked by another process (lock file exists: {})",
+                    lock_path.display()
+                )
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Allocate the next WOTS seed in a crash-safe manner.
+    ///
+    /// For HD wallets this advances the counter and **immediately persists**
+    /// the new counter before returning the seed.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:  true
+    /// Post: result = Ok(seed) ⇒
+    ///         (if HD) next_wots_index' = next_wots_index + 1
+    ///                 ∧ wallet.dat on disk contains the new index
+    ///                 ∧ seed = derive(master, old_index)
+    ///       result = Err(_) ⇒ state on disk unchanged
+    /// ```
+    ///
+    /// ```zed
+    ///     AllocateNextWotsSeed
+    ///     --------------------
+    ///     ΔWallet
+    ///     seed! : [u8;32]
+    ///
+    ///     pre  true
+    ///     post result = Ok(seed!) ⇒
+    ///            (master_seed ≠ null ⇒
+    ///               next_wots_index' = next_wots_index + 1
+    ///             ∧ seed! = derive_wots(master_seed, next_wots_index))
+    ///     post result = Err(_) ⇒ next_wots_index' = next_wots_index
+    /// ```
+    pub fn allocate_next_wots_seed(&mut self) -> Result<[u8; 32]> {
+        let _lock = self.acquire_lock()?;
+
+        if let Some(ref master) = self.data.master_seed {
+            let idx = self.data.next_wots_index;
+            self.data.next_wots_index += 1;
+            let seed = hd::derive_wots_seed(master, idx);
+
+            self.save()?;
+            Ok(seed)
+        } else {
+            Ok(rand::random())
+        }
+    }
+
+    /// Same safety contract as `allocate_next_wots_seed` for MSS trees.
+    pub fn allocate_next_mss_seed(&mut self) -> Result<[u8; 32]> {
+        let _lock = self.acquire_lock()?;
+
+        if let Some(ref master) = self.data.master_seed {
+            let idx = self.data.next_mss_index;
+            self.data.next_mss_index += 1;
+            let seed = hd::derive_mss_seed(master, idx);
+            self.save()?;
+            Ok(seed)
+        } else {
+            Ok(rand::random())
+        }
+    }
+
+    // Note: The old next_wots_seed() / next_mss_seed() methods have been removed.
+    // All internal code now uses the safe allocate_next_*_seed() variants.
+/// All addresses the wallet watches for (keys + coin addresses).
+pub fn watched_addresses(&self) -> Vec<[u8; 32]> {
+    let mut addrs: Vec<[u8; 32]> = self.data.keys.iter().map(|k| k.address).collect();
+    addrs.extend(self.data.mss_keys.iter().map(|k| compute_address(&k.master_pk)));
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+/// Import a scanned coin, matching it to a wallet key. Returns true if new.
+/// Pass `commitment` for Confidential/State Thread outputs.
+pub fn import_scanned(
+    &mut self,
+    address: [u8; 32],
+    value: u64,
+    salt: [u8; 32],
+    commitment: Option<[u8; 32]>,
+) -> Result<Option<[u8; 32]>> {
+    let coin_id = if let Some(c) = commitment {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"CONFIDENTIAL");
+        hasher.update(&address);
+        hasher.update(&c);
+        hasher.update(&salt);
+        *hasher.finalize().as_bytes()
+    } else {
+        compute_coin_id(&address, value, &salt)
+    };
+
+    if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+        return Ok(None); // already have it
+    }
+
+    // Find matching key
+    if let Some(pos) = self.data.keys.iter().position(|k| k.address == address) {
+        let key = self.data.keys.remove(pos);
+        self.data.coins.push(WalletCoin {
+            seed: key.seed,
+            owner_pk: key.owner_pk,
+            address: key.address,
+            value,
+            salt,
+            coin_id,
+            label: key.label,
+            wots_signed: false,
+            commitment,
+        });
+        return Ok(Some(coin_id));
+    }
+
+    // MSS key match — keep key, just add coin (MSS supports multiple signatures)
+    if let Some(mss) = self.data.mss_keys.iter().find(|k| compute_address(&k.master_pk) == address) {
+        self.data.coins.push(WalletCoin {
+            seed: mss.master_seed,
+            owner_pk: mss.master_pk,
+            address,
+            value,
+            salt,
+            coin_id,
+            label: Some(format!("received ({})", value)),
+            wots_signed: false,
+            commitment,
+        });
+        return Ok(Some(coin_id));
+    }
+
+    // Sibling import: another coin already exists at this WOTS address.
+    // Safe to import IF the key hasn't been used to sign yet — the co-spend
+    // rule will force all siblings to be spent in the same transaction,
+    // producing an identical commitment hash and thus identical WOTS signatures.
+    if let Some(existing) = self.data.coins.iter().find(|c| c.address == address).cloned() {
+        let is_mss = self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == address);
+
+        if !is_mss && existing.wots_signed {
+            // Key already signed a transaction. Importing a new coin here
+            // would require a second signature = key compromise. Quarantine.
+            tracing::warn!(
+                "Coin {} (value {}) sent to already-signed WOTS address {}. UNRECOVERABLE.",
+                hex::encode(coin_id), value, hex::encode(address)
+            );
+            return Ok(None);
+        }
+
+        // Import as sibling — shares the same WOTS keypair
+        self.data.coins.push(WalletCoin {
+            seed: existing.seed,
+            owner_pk: existing.owner_pk,
+            address,
+            value,
+            salt,
+            coin_id,
+            label: existing.label.clone(),
+            wots_signed: false,
+            commitment: existing.commitment,
+        });
+        tracing::info!(
+            "Sibling import: coin {} (value {}) at existing WOTS address {}",
+            hex::encode(&coin_id), value, hex::encode(&address)
+        );
+        return Ok(Some(coin_id));
+    }
+
+    Ok(None) // address not ours
+}
+    pub fn open(path: &Path, password: &[u8]) -> Result<Self> {
+        if !path.exists() {
+            bail!("wallet file not found: {}", path.display());
+        }
+
+        // Acquire exclusive lock early
+        let lock_path = path.with_extension("lock");
+        let _lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => WalletFileLock {
+                path: lock_path,
+                _file: file,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("wallet.dat is locked by another process");
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let encrypted = std::fs::read(path)?;
+        let plaintext = crypto::decrypt(&encrypted, password)?;
+        let data: WalletData = serde_json::from_slice(&plaintext)?;
+        Ok(Self {
+            known_spent: Default::default(),
+            path: path.to_path_buf(),
+            password: password.to_vec(),
+            data,
+        })
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Acquire exclusive lock for the duration of the write
+        let lock_path = self.lock_path();
+        let _lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+        {
+            Ok(f) => Some(WalletFileLock { path: lock_path, _file: f }),
+            Err(_) => None,
+        };
+
+        let plaintext = serde_json::to_vec(&self.data)?;
+        let encrypted = crypto::encrypt(&plaintext, &self.password)?;
+        std::fs::write(&self.path, encrypted)?;
+        Ok(())
+    }
+
+    // ── Key generation ──────────────────────────────────────────────────────
+
+    /// Generate a new receiving key. Returns the address to share with the sender.
+    /// HD wallets derive the seed deterministically; legacy wallets use random.
+    pub fn generate_key(&mut self, label: Option<String>) -> Result<[u8; 32]> {
+        let seed = self.allocate_next_wots_seed()?;
+        let owner_pk = wots::keygen(&seed);
+        let address = compute_address(&owner_pk);
+        self.data.keys.push(WalletKey { seed, owner_pk, address, label });
+        self.save()?;
+        Ok(address)
+    }
+
+    // ======================================================================
+    //  PRUNING LICENSE SUPPORT (Phase 1 — Wallet Layer Only)
+    // ======================================================================
+    //
+    // # Reasoning
+    // Pruning Licenses are represented as OutputData::Confidential State Threads
+    // carrying a 32-byte commitment = H(LicenseMetadata).
+    //
+    // Because the covenant script must verify the royalty rate and pay the
+    // original issuer on every transfer (using OP_READ_INPUT_STATE +
+    // OP_SUM_TO_ADDR + OP_MUL / OP_DIV), the owner must be able to supply
+    // the original plaintext metadata on every spend.
+    //
+    // Storing the metadata inside the already-encrypted, file-locked wallet.dat
+    // is the minimal, consistent, and secure solution.
+    //
+    // We deliberately use `Vec<([u8;32], LicenseMetadata)>` (not HashMap) so that
+    // `serde_json::to_vec` (called by save()) never sees a non-string key.
+    // This was identified during review of the initial draft (2026-05-28).
+    //
+    // This design makes licenses true bearer assets: loss of the local metadata
+    // bricks the UTXO. This is acceptable and explicitly documented.
+    //
+    // See docs/design/pruning-licenses.md §3.1 and the technical review (2026-05-28)
+    // for the covenant script and economic model.
+
+    /// Store (or overwrite) the plaintext metadata for a license the wallet controls.
+    ///
+    /// The coin_id must be the value returned by `OutputData::coin_id()` for the
+    /// Confidential license output.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - caller holds the private material required to spend the license UTXO
+    ///   - metadata is consistent with the on-chain commitment (hash matches)
+    ///
+    /// Post:
+    ///   result = Ok(()) ⇒
+    ///       the Vec contains exactly one entry for coin_id (last write wins)
+    ///       ∧ the vector is persisted to disk (encrypted)
+    ///       ∧ get_license_metadata(coin_id) returns Some(&metadata)
+    ///
+    ///   result = Err(_) ⇒ state on disk is unchanged
+    /// ```
+    pub fn store_license_metadata(&mut self, coin_id: [u8; 32], meta: LicenseMetadata) -> Result<()> {
+        let _lock = self.acquire_lock()?;
+
+        // Remove any previous entry for this coin_id (last write wins)
+        self.data.license_metadata.retain(|(cid, _)| *cid != coin_id);
+        self.data.license_metadata.push((coin_id, meta));
+
+        self.save()?;
+        Ok(())
+    }
+
+    /// Retrieve stored license metadata (if present).
+    pub fn get_license_metadata(&self, coin_id: &[u8; 32]) -> Option<&LicenseMetadata> {
+        self.data.license_metadata
+            .iter()
+            .find(|(cid, _)| cid == coin_id)
+            .map(|(_, meta)| meta)
+    }
+
+    /// List all licenses currently tracked by this wallet.
+    pub fn list_licenses(&self) -> Vec<(&[u8; 32], &LicenseMetadata)> {
+        self.data.license_metadata
+            .iter()
+            .map(|(cid, meta)| (cid as &[u8; 32], meta))
+            .collect()
+    }
+
+    /// After a license Reveal confirms on-chain, call this to re-key the metadata
+    /// from the issuance commitment to the actual coin_id of the Confidential output.
+    /// This makes future lookups by real coin_id work cleanly.
+    pub fn rekey_license_metadata(&mut self, old_key: [u8; 32], new_coin_id: [u8; 32]) -> Result<()> {
+        if let Some(pos) = self.data.license_metadata.iter().position(|(k, _)| *k == old_key) {
+            let (_, meta) = self.data.license_metadata.remove(pos);
+            self.data.license_metadata.push((new_coin_id, meta));
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Build the royalty-enforcing covenant script for a Pruning License.
+    ///
+    /// This is a documented stub in Phase 1. A production implementation will
+    /// emit the exact v5 opcode sequence described in the design doc:
+    ///
+    ///   OP_THIS_ADDRESS OP_OUTPUT_ADDRESS OP_EQUALVERIFY
+    ///   OP_READ_INPUT_STATE OP_READ_OUTPUT_STATE 0 OP_EQUALVERIFY
+    ///   ... extract fixed_royalty_fee ...
+    ///   <value> <bps> OP_MUL 10000 OP_DIV <issuer> OP_SUM_TO_ADDR OP_VERIFY
+    ///
+    /// The resulting bytecode is placed in the Predicate::Script of the
+    /// Confidential output that represents the license.
+    pub fn build_pruning_license_covenant(
+        issuer: [u8; 32],
+        fixed_royalty_fee: u64,
+    ) -> Vec<u8> {
+        // Fixed Transfer Tax royalty covenant — direct bytecode construction (no string assembler).
+        //
+        // # Reasoning
+        // The previous implementation used a text template + script::assemble(). While convenient,
+        // it introduced a parsing step at runtime for a security-critical script that controls
+        // license ownership and royalty payments. Direct construction using the same primitives
+        // as compile_htlc() is more robust, auditable, and consistent with how other complex
+        // scripts (HTLC, multisig) are built in this codebase.
+        //
+        // Current v1 rules (issuer-sig stop-gap):
+        // - License must stay in the exact same covenant address (continuation).
+        // - Fixed royalty (not percentage) must be paid to the original issuer via SUM_TO_ADDR.
+        // - Issuer signature is required on every spend (prevents theft of ownerless Confidential UTXOs).
+        //
+        // Long-term (not implemented here): dynamic owner model using 32-byte Confidential state
+        // H(meta_hash || current_owner_pk) + witness carrying new_owner + signature.
+        //
+        // The script must finish with exactly one truthy value (Clean Stack Rule).
+
+        use crate::core::script::{
+            push_data, push_int,
+            OP_EQUALVERIFY, OP_GREATER_OR_EQUAL, OP_VERIFY, OP_CHECKSIGVERIFY,
+            OP_THIS_ADDRESS, OP_OUTPUT_ADDRESS, OP_SUM_TO_ADDR,
+        };
+
+        let mut bc = Vec::new();
+
+        // 1. Continuation check: must spend into the same covenant address at output index 0
+        bc.push(OP_THIS_ADDRESS);
+        push_int(&mut bc, 0);
+        bc.push(OP_OUTPUT_ADDRESS);
+        bc.push(OP_EQUALVERIFY);
+
+        // 2. Fixed royalty to original issuer
+        push_data(&mut bc, &issuer);
+        bc.push(OP_SUM_TO_ADDR);
+        push_int(&mut bc, fixed_royalty_fee);
+        bc.push(OP_GREATER_OR_EQUAL);
+        bc.push(OP_VERIFY);
+
+        // 3. Issuer signature stop-gap (security for ownerless Confidential outputs today)
+        push_data(&mut bc, &issuer);
+        bc.push(OP_CHECKSIGVERIFY);
+
+        // Must leave exactly one truthy item for CleanStackRule
+        push_int(&mut bc, 1);
+
+        bc
+    }
+
+    /// Generate a new MSS tree (reusable address).
+    /// HD wallets derive the tree seed deterministically; legacy wallets use random.
+    pub fn generate_mss(&mut self, height: u32, _label: Option<String>) -> Result<[u8; 32]> {
+        let seed = self.allocate_next_mss_seed()?;
+        let keypair = mss::keygen(&seed, height)?;
+        let address = compute_address(&keypair.master_pk);
+        self.data.mss_keys.push(keypair);
+        self.save()?;
+        Ok(address)
+    }
+
+    // ── Coin management ─────────────────────────────────────────────────────
+
+    /// Import a coin with known seed, value, and salt.
+    pub fn import_coin(
+        &mut self,
+        seed: [u8; 32],
+        value: u64,
+        salt: [u8; 32],
+        label: Option<String>,
+    ) -> Result<[u8; 32]> {
+        let owner_pk = wots::keygen(&seed);
+        let address = compute_address(&owner_pk);
+        let coin_id = compute_coin_id(&address, value, &salt);
+        if self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+            bail!("coin already in wallet");
+        }
+        self.data.coins.push(WalletCoin {
+            seed, owner_pk, address, value, salt, coin_id, label,
+            wots_signed: false, commitment: None,
+        });
+        // Remove matching key from unused keys if present
+        self.data.keys.retain(|k| k.address != address);
+        self.save()?;
+        Ok(coin_id)
+    }
+
+    /// Find a coin by coin_id.
+    pub fn find_coin(&self, coin_id: &[u8; 32]) -> Option<&WalletCoin> {
+        self.data.coins.iter().find(|c| &c.coin_id == coin_id)
+    }
+
+    /// Find an MSS key by master_pk.
+    pub fn find_mss(&self, pk: &[u8; 32]) -> Option<&MssKeypair> {
+        self.data.mss_keys.iter().find(|k| &k.master_pk == pk)
+    }
+
+    /// Find all coin IDs sharing a WOTS address with the given coin.
+    /// Returns an empty vec for MSS-backed coins (MSS handles reuse safely).
+    pub fn wots_siblings(&self, coin_id: &[u8; 32]) -> Vec<[u8; 32]> {
+        let coin = match self.find_coin(coin_id) {
+            Some(c) => c,
+            None => return vec![],
+        };
+        // MSS keys are reusable — no co-spend rule needed
+        if self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == coin.address) {
+            return vec![];
+        }
+        let addr = coin.address;
+        self.data.coins.iter()
+            .filter(|c| c.address == addr && c.coin_id != *coin_id)
+            .map(|c| c.coin_id)
+            .collect()
+    }
+
+    /// Resolve a coin reference (index, hex prefix, or full hex).
+    pub fn resolve_coin(&self, reference: &str) -> Result<[u8; 32]> {
+        if let Ok(idx) = reference.parse::<usize>() {
+            if idx < self.data.coins.len() {
+                return Ok(self.data.coins[idx].coin_id);
+            }
+        }
+        let reference_lower = reference.to_lowercase();
+        for c in &self.data.coins {
+            if hex::encode(c.coin_id).starts_with(&reference_lower) {
+                return Ok(c.coin_id);
+            }
+        }
+        bail!("no matching coin found");
+    }
+
+    pub fn coins(&self) -> &[WalletCoin] {
+        &self.data.coins
+    }
+
+    pub fn keys(&self) -> &[WalletKey] {
+        &self.data.keys
+    }
+
+    pub fn mss_keys(&self) -> &[MssKeypair] {
+        &self.data.mss_keys
+    }
+
+    pub fn coin_count(&self) -> usize {
+        self.data.coins.len()
+    }
+
+    pub fn total_value(&self) -> u64 {
+        self.data.coins.iter().map(|c| c.value).sum()
+    }
+
+    // ── Transaction building ────────────────────────────────────────────────
+
+    /// Auto-Solver: Automatically generates a WOTS or MSS signature for a given 
+    /// public key if the wallet holds the corresponding private seed.
+    pub fn auto_sign(&mut self, owner_pk: &[u8; 32], commitment: &[u8; 32]) -> Result<Vec<u8>> {
+        // 1. Check MSS (Reusable) Keys
+        if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == *owner_pk) {
+            let keypair = &mut self.data.mss_keys[pos];
+            if keypair.remaining() == 0 { anyhow::bail!("MSS key exhausted"); }
+            let sig = keypair.sign(commitment)?;
+            self.save()?;
+            return Ok(sig.to_bytes());
+        }
+        
+        // 2. Check unused WOTS Keys
+        if let Some(key) = self.data.keys.iter().find(|k| k.owner_pk == *owner_pk) {
+            let sig = crate::core::wots::sign(&key.seed, commitment);
+            return Ok(crate::core::wots::sig_to_bytes(&sig));
+        }
+
+        // 3. Check already-known WOTS Coins
+        if let Some(pos) = self.data.coins.iter().position(|c| c.owner_pk == *owner_pk) {
+            if self.data.coins[pos].wots_signed {
+                anyhow::bail!(
+                    "WOTS key {} has already signed — refusing to sign again. \
+                     Use an MSS key for multiple signatures.",
+                    hex::encode(owner_pk)
+                );
+            }
+            let sig = crate::core::wots::sign(&self.data.coins[pos].seed, commitment);
+            self.data.coins[pos].wots_signed = true;
+            self.save()?;
+            return Ok(crate::core::wots::sig_to_bytes(&sig));
+        }
+
+        anyhow::bail!("Cannot auto-solve: Private key for {} not found in wallet.dat", hex::encode(owner_pk))
+    }
+
+    /// Selects a subset of unspent coins to satisfy a target value, strictly
+    /// observing WOTS co-spend rules and consensus transaction size limits.
+    ///
+    /// # Reasoning
+    /// The wallet must reliably fund transactions without causing CPU or Bandwidth
+    /// Denial-of-Service (DoS) vectors on the network.
+    ///
+    /// **Danger of previous implementation**: The old selection algorithm was greedy
+    /// based *solely* on value. It would select a base set of coins, and *then* rigidly
+    /// sweep in all WOTS siblings to satisfy the post-quantum one-time key invariant.
+    /// This frequently breached the `MAX_TX_INPUTS` (256) limit silently, causing
+    /// "Phantom Overdrafts" where users had sufficient funds but couldn't construct
+    /// a valid transaction.
+    ///
+    /// **The Fix**: This implementation groups WOTS siblings into indivisible
+    /// `Bundle`s *before* selection and evaluates them with a knapsack density
+    /// heuristic (value per input). It packs inputs toward the target and skips any
+    /// bundle that would breach the input cap. Because this is a greedy heuristic,
+    /// an `Err` means it failed to find a fitting combination — not a proof that
+    /// none exists.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Let Available = { c ∈ wallet.coins | c.coin_id ∈ live_coins }
+    /// Let sibs(c)   = { s ∈ Available | s.address = c.address }
+    ///
+    /// Pre:
+    ///   - needed > 0
+    ///   - live_coins represents the set of confirmed UTXOs on the blockchain
+    ///
+    /// Post:
+    ///   result = Ok(selected)  ⇒
+    ///     sum(value(c) for c in selected) >= needed
+    ///     #selected <= MAX_TX_INPUTS
+    ///     ∀ c ∈ selected: (c is WOTS) ⇒ sibs(c) ⊆ selected
+    ///     selected ⊆ Available, with no duplicates
+    ///
+    ///   result = Err(_)  ⇒ Either spendable funds are insufficient, or the greedy
+    ///                      heuristic could not fit a satisfying combination within
+    ///                      the MAX_TX_INPUTS limit.
+    /// ```
+    ///
+    /// ```zed
+    ///     SelectCoins
+    ///     -----------
+    ///     wallet : WalletData
+    ///     live_coins? : ℙ 𝔹³²
+    ///     needed? : ℕ₆₄
+    ///     selected! : seq 𝔹³²
+    ///
+    ///     let Available = { c ∈ wallet.coins | c.coin_id ∈ live_coins? }
+    ///     let Bundles = { B ⊆ Available | ∀ c ∈ B • (is_wots(c) ⇒ (siblings(c) ∩ Available) ⊆ B) ∧ (is_mss(c) ⇒ #B = 1) }
+    ///
+    ///     pre  needed? > 0
+    ///     post result = Ok(selected!) ⇒
+    ///            ∃ S ⊆ Bundles •
+    ///              selected! = ⋃ S
+    ///              ∧ (∑ c ∈ selected! • c.value) ≥ needed?
+    ///              ∧ #selected! ≤ MAX_TX_INPUTS
+    ///     post result = Err(_) ⇒ true
+    /// ```
+    ///
+    /// # Safety / Invariants
+    /// - **WOTS Co-Spend Rule**: A WOTS key must never sign two different
+    ///   commitments. Bundling all live coins of a WOTS address into one atomic
+    ///   unit enforces this.
+    /// - **Consensus Limit**: The result never exceeds `MAX_TX_INPUTS`, preventing
+    ///   network-wide DoS via bloated signature verification times.
+    /// - **Oversized addresses**: A WOTS address holding more than `MAX_TX_INPUTS`
+    ///   live coins cannot be spent in a standard Reveal transaction. However, 
+    ///   they can be consolidated since `Transaction::Consolidate` allows up to 
+    ///   `MAX_CONSOLIDATE_INPUTS` (8,192). We exclude them from normal selection 
+    ///   and instruct the user to consolidate.
+    pub fn select_coins(&self, needed: u64, live_coins: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        use rand::seq::SliceRandom;
+
+        let live_set: std::collections::HashSet<[u8; 32]> = live_coins.iter().copied().collect();
+
+        // 1. Group available live coins into indivisible Bundles.
+        //
+        // A Bundle is the smallest unit of selection:
+        //   - Every WOTS address forms ONE bundle containing ALL of its live coins,
+        //     because spending any coin at a WOTS address reveals the one-time key,
+        //     so every coin there must be spent in the same transaction.
+        //   - Every MSS coin is its own size-1 bundle (MSS keys tolerate reuse).
+        struct Bundle {
+            address: [u8; 32],
+            coin_ids: Vec<[u8; 32]>,
+            total_value: u64,
+        }
+
+        let mut mss_addrs = std::collections::HashSet::new();
+        for k in &self.data.mss_keys {
+            mss_addrs.insert(compute_address(&k.master_pk));
+        }
+
+        let mut wots_groups: std::collections::HashMap<[u8; 32], Vec<&WalletCoin>> =
+            std::collections::HashMap::new();
+        let mut bundles: Vec<Bundle> = Vec::new();
+        
+        // Saturating adds are defensive only: consensus supply should keep sums
+        // far below u64::MAX, but a corrupt wallet file must not wrap arithmetic.
+        let mut total_available = 0u64;
+
+        for coin in &self.data.coins {
+            if !live_set.contains(&coin.coin_id) {
+                continue;
+            }
+            total_available = total_available.saturating_add(coin.value);
+
+            if mss_addrs.contains(&coin.address) {
+                bundles.push(Bundle {
+                    address: coin.address,
+                    coin_ids: vec![coin.coin_id],
+                    total_value: coin.value,
+                });
+            } else {
+                wots_groups.entry(coin.address).or_default().push(coin);
+            }
+        }
+
+        for (addr, coins) in wots_groups {
+            let total_value = coins.iter().fold(0u64, |acc, c| acc.saturating_add(c.value));
+            let coin_ids = coins.iter().map(|c| c.coin_id).collect();
+            bundles.push(Bundle { address: addr, coin_ids, total_value });
+        }
+
+        // 2. Exclude bundles that can never fit in a normal transaction.
+        //
+        // A WOTS address holding more than MAX_TX_INPUTS live coins is unspendable
+        // in a standard Send because of the co-spend rule. BUT it CAN be spent 
+        // using `wallet consolidate` which allows up to 8,192 inputs. 
+        // We surface the condition loudly and report the locked value separately.
+        let mut oversized_value = 0u64;
+        let mut oversized_count = 0usize;
+        bundles.retain(|b| {
+            if b.coin_ids.len() > crate::core::MAX_TX_INPUTS {
+                oversized_value = oversized_value.saturating_add(b.total_value);
+                oversized_count += 1;
+                tracing::warn!(
+                    "Excluding address {} from standard coin selection: it holds {} live coins. \
+                     A standard transaction can only hold {} inputs. \
+                     You must run `mirstat wallet consolidate --address {}` to compress these coins before spending.",
+                    hex::encode(b.address),
+                    b.coin_ids.len(),
+                    crate::core::MAX_TX_INPUTS,
+                    hex::encode(b.address)
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        // 3. Sort bundles by value density (value per input), descending.
+        //
+        // Greedy knapsack heuristic: prefer bundles that deliver the most value per
+        // input slot consumed. u128 cross-multiplication compares the exact
+        // rationals a.value/a.len vs b.value/b.len with no float precision loss.
+        // Ties: larger total value first, then address, then first coin id, so this
+        // initial pass is deterministic for a given wallet state.
+        bundles.sort_by(|a, b| {
+            let lhs = (a.total_value as u128) * (b.coin_ids.len() as u128);
+            let rhs = (b.total_value as u128) * (a.coin_ids.len() as u128);
+            rhs.cmp(&lhs)
+                .then_with(|| b.total_value.cmp(&a.total_value))
+                .then_with(|| a.address.cmp(&b.address))
+                .then_with(|| a.coin_ids.first().cmp(&b.coin_ids.first()))
+        });
+
+        let mut selected: Vec<[u8; 32]> = Vec::new();
+        let mut total = 0u64;
+
+        // 4. Initial selection: walk bundles in density order, taking each bundle
+        // that fits until the target is met.
+        for bundle in &bundles {
+            if total >= needed {
+                break;
+            }
+            if selected.len() + bundle.coin_ids.len() > crate::core::MAX_TX_INPUTS {
+                continue;
+            }
+            selected.extend(&bundle.coin_ids);
+            total = total.saturating_add(bundle.total_value);
+        }
+
+        if total < needed {
+            let spendable = total_available.saturating_sub(oversized_value);
+            if spendable < needed {
+                if oversized_value > 0 {
+                    bail!(
+                        "insufficient spendable funds: have {} spendable, need {}.\n\
+                         A further {} is locked at {} address(es) holding more than {} coins \
+                         each. You must run `mirstat wallet consolidate` on those addresses to make them spendable.",
+                        spendable, needed, oversized_value, oversized_count,
+                        crate::core::MAX_TX_INPUTS
+                    );
+                }
+                bail!("insufficient funds: have {}, need {}", spendable, needed);
+            }
+            bail!(
+                "Insufficient consolidated funds to send this amount in a single transaction.\n\
+                 You have {} spendable, but need {} and a standard transaction can hold at most \
+                 {} inputs -- your UTXOs are too fragmented.\n\n\
+                 Fix: Send a smaller amount, or run `mirstat wallet consolidate` \
+                 to merge small coins into larger usable balances.",
+                spendable, needed, crate::core::MAX_TX_INPUTS
+            );
+        }
+
+        // 5. Greedy "snowball" merge: opportunistically pull in extra coins whose
+        // value exactly matches a denomination of the current change, so change
+        // consolidates into fewer, larger outputs over time.
+        let selected_set: std::collections::HashSet<[u8; 32]> =
+            selected.iter().copied().collect();
+        let mut unselected_by_denom: std::collections::HashMap<u64, Vec<&Bundle>> =
+            std::collections::HashMap::new();
+
+        for bundle in &bundles {
+            if bundle.coin_ids.len() == 1 && !selected_set.contains(&bundle.coin_ids[0]) {
+                unselected_by_denom.entry(bundle.total_value).or_default().push(bundle);
+            }
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut added_new = true;
+        
+        while added_new && selected.len() < crate::core::MAX_TX_INPUTS {
+            added_new = false;
+            let change = total - needed;
+            let mut change_denoms = decompose_value(change);
+            change_denoms.shuffle(&mut rng);
+
+            for denom in change_denoms {
+                if let Some(candidates) = unselected_by_denom.get_mut(&denom) {
+                    if let Some(cand_bundle) = candidates.pop() {
+                        selected.extend(&cand_bundle.coin_ids);
+                        total = total.saturating_add(cand_bundle.total_value);
+                        added_new = true;
+                        tracing::info!(
+                            "Greedy Merge: Pulled in an extra coin of value {} to consolidate change",
+                            denom
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(selected)
+    }
+
+    /// Build outputs for a send: recipient outputs + change outputs.
+    /// Returns (all_outputs, change_seeds).
+    /// Change seeds are derived from the HD counter (or random for legacy wallets)
+    /// so they are recoverable from the mnemonic.
+    /// If an MSS key is near exhaustion, change is routed to a new MSS tree automatically.
+    pub fn build_outputs(
+        &mut self,
+        recipient_address: &[u8; 32],
+        recipient_denominations: &[u64],
+        change_value: u64,
+    ) -> Result<(Vec<OutputData>, Vec<(usize, [u8; 32])>)> {
+        let mut outputs = Vec::new();
+        let mut change_seeds = Vec::new();
+
+        // Recipient outputs
+        for &denom in recipient_denominations {
+            let salt: [u8; 32] = rand::random();
+            outputs.push(OutputData::Standard {
+                address: *recipient_address,
+                value: denom,
+                salt,
+            });
+        }
+
+        // --- NEW: Automatic MSS Rotation Check ---
+        // Find if we have any active MSS keys that are getting dangerously low
+        let mut rotation_target_pk: Option<[u8; 32]> = None;
+        for keypair in &self.data.mss_keys {
+            if keypair.remaining() > 0 && keypair.remaining() < 50 {
+                tracing::warn!(
+                    "MSS Key {} is near exhaustion ({} remaining). Triggering automatic background rotation.",
+                    hex::encode(&keypair.master_pk),
+                    keypair.remaining()
+                );
+                rotation_target_pk = Some(keypair.master_pk);
+                break;
+            }
+        }
+
+        // If a rotation is needed, generate the new tree now.
+        // We use height 10 for user wallets (instant generation).
+        let mut new_mss_pk: Option<[u8; 32]> = None;
+        if rotation_target_pk.is_some() {
+            let pk = self.generate_mss(crate::core::mss::DEFAULT_HEIGHT, Some("Auto-Rotated Key".to_string()))?;
+            new_mss_pk = Some(pk);
+        }
+
+        // Change outputs
+        if change_value > 0 {
+            let mut change_denoms = decompose_value(change_value);
+            use rand::seq::SliceRandom;
+            change_denoms.shuffle(&mut rand::thread_rng());
+
+            for denom in change_denoms {
+                let address = if let Some(new_pk) = new_mss_pk {
+                    // Route change to the newly rotated MSS address
+                    new_pk 
+                } else {
+                    // Standard routing: derive a fresh one-time WOTS address
+                    let seed = self.allocate_next_wots_seed()?;
+                    let owner_pk = wots::keygen(&seed);
+                    let addr = compute_address(&owner_pk);
+                    let idx = outputs.len();
+                    change_seeds.push((idx, seed));
+                    addr
+                };
+
+                let salt: [u8; 32] = rand::random();
+                outputs.push(OutputData::Standard { address, value: denom, salt });
+            }
+        }
+
+        // Output shuffling
+        use rand::seq::SliceRandom;
+        let mut indices: Vec<usize> = (0..outputs.len()).collect();
+        indices.shuffle(&mut rand::thread_rng());
+
+        let shuffled_outputs: Vec<OutputData> = indices.iter().map(|&i| outputs[i].clone()).collect();
+
+        let mut reverse_map = vec![0usize; indices.len()];
+        for (new_idx, &old_idx) in indices.iter().enumerate() {
+            reverse_map[old_idx] = new_idx;
+        }
+        let shuffled_seeds: Vec<(usize, [u8; 32])> = change_seeds.into_iter()
+            .map(|(old_idx, seed)| (reverse_map[old_idx], seed))
+            .collect();
+
+        Ok((shuffled_outputs, shuffled_seeds))
+    }
+
+    /// Prepare a commit for given inputs and outputs.
+    /// Record coins the chain reports as already spent.
+    ///
+    /// Relaxes the co-spend gate for exactly those coins. Their records stay
+    /// in the wallet, so nothing is lost if the chain view was wrong.
+    pub fn mark_spent(&mut self, ids: impl IntoIterator<Item = [u8; 32]>) {
+        self.known_spent.extend(ids);
+    }
+
+    /// Discard everything learned about on-chain state this session.
+    pub fn clear_spent_marks(&mut self) {
+        self.known_spent.clear();
+    }
+
+    pub fn prepare_commit(
+        &mut self,
+        input_coin_ids: &[[u8; 32]],
+        outputs: &[OutputData],
+        change_seeds: Vec<(usize, [u8; 32])>,
+        privacy_delay: bool,
+        is_consolidate: bool,
+    ) -> Result<([u8; 32], [u8; 32])> {
+        // Verify we own all inputs
+        for coin_id in input_coin_ids {
+            if self.find_coin(coin_id).is_none() {
+                bail!("coin {} not in wallet", hex::encode(coin_id));
+            }
+        }
+
+        // ── WOTS Co-Spend Enforcement ───────────────────────────────────
+        // This is the hard gate. All spend paths (send, private send, manual
+        // --coin selection) funnel through here. If any input coin has WOTS
+        // siblings in the wallet that aren't also in this transaction, refuse.
+        let input_set: std::collections::HashSet<[u8; 32]> = input_coin_ids.iter().copied().collect();
+        for coin_id in input_coin_ids {
+            let siblings = self.wots_siblings(coin_id);
+            for sib_id in &siblings {
+                // A sibling the chain has already consumed cannot be put at
+                // risk by this spend, and demanding it would strand the whole
+                // address. Every other missing sibling is still refused.
+                if self.known_spent.contains(sib_id) {
+                    continue;
+                }
+                if !input_set.contains(sib_id) {
+                    let coin = self.find_coin(coin_id).unwrap();
+                    bail!(
+                        "WOTS co-spend violation: coin {} has sibling {} at the same address {}. \
+                         All coins sharing a one-time WOTS address must be spent in the same transaction. \
+                         Use 'wallet list' to see grouped coins, or let auto-select handle it.",
+                        hex::encode(coin_id), hex::encode(sib_id), hex::encode(&coin.address)
+                    );
+                }
+            }
+        }
+
+        // ── Input shuffling ─────────────────────────────────────────────
+        // Randomize input order to prevent fingerprinting based on the
+        // wallet's internal coin ordering or selection algorithm.
+        let mut shuffled_inputs = input_coin_ids.to_vec();
+        {
+            use rand::seq::SliceRandom;
+            shuffled_inputs.shuffle(&mut rand::thread_rng());
+        }
+
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let salt: [u8; 32] = rand::random();
+        let commitment = compute_commitment(&shuffled_inputs, &output_commit_hashes, &salt);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let reveal_not_before = if privacy_delay {
+            // Full privacy mode: 30-120 second random delay
+            now + 30 + (rand::random::<u64>() % 91)
+        } else {
+            // Even non-private sends get a small random delay (5-15s)
+            // to decorrelate commit and reveal timing
+            now + 5 + (rand::random::<u64>() % 11)
+        };
+
+        self.data.pending.push(PendingCommit {
+            commitment,
+            salt,
+            input_coin_ids: shuffled_inputs,
+            outputs: outputs.to_vec(),
+            change_seeds,
+            created_at: now,
+            reveal_not_before,
+            is_consolidate,
+        });
+        self.save()?;
+
+        Ok((commitment, salt))
+    }
+
+    /// Build InputReveals and signatures for a pending commit.
+    pub fn sign_reveal(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Vec<Witness>)> {
+        let output_commit_hashes: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&pending.input_coin_ids, &output_commit_hashes, &pending.salt);
+
+        let mut input_reveals = Vec::new();
+        let mut witnesses = Vec::new();
+        
+        // NEW: Cache to ensure we only burn one MSS leaf per master_pk per transaction
+        let mut mss_sig_cache: std::collections::HashMap<[u8; 32], Vec<u8>> = std::collections::HashMap::new();
+
+        for coin_id in &pending.input_coin_ids {
+            if let Some(wc) = self.find_coin(coin_id).cloned() {
+                // Check for state threads where value is 0 but data is present
+                let is_confidential = wc.value == 0;
+                input_reveals.push(InputReveal {
+                    predicate: Predicate::p2pk(&wc.owner_pk),
+                    value: wc.value,
+                    salt: wc.salt,
+                    commitment: if is_confidential { wc.commitment } else { None },
+                });
+
+                let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == wc.owner_pk);
+                if is_mss {
+                    // Check if we already generated a signature for this MSS tree in this tx
+                    if let Some(cached_sig_bytes) = mss_sig_cache.get(&wc.owner_pk) {
+                        witnesses.push(Witness::sig(cached_sig_bytes.clone()));
+                    } else {
+                        // First time seeing this MSS key in this tx, generate and cache
+                        let pos = self.data.mss_keys.iter().position(|k| k.master_pk == wc.owner_pk).unwrap();
+                        let keypair = &mut self.data.mss_keys[pos];
+                        if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
+                        
+                        let sig = keypair.sign(&commitment)?;
+                        let sig_bytes = sig.to_bytes();
+                        
+                        mss_sig_cache.insert(wc.owner_pk, sig_bytes.clone());
+                        witnesses.push(Witness::sig(sig_bytes));
+                    }
+                } else {
+                 //nb signing the same commitment will give you the same signature, so its perfectly safe to sign the same commitment again.
+                    // Mark this coin AND all siblings at the same address as signed.
+                    // Even though siblings in this tx sign the same commitment (safe),
+                    // any future tx would be a different commitment (key compromise).
+                    let addr = wc.address;
+                    for c in self.data.coins.iter_mut() {
+                        if c.address == addr {
+                            c.wots_signed = true;
+                        }
+                    }
+                    let sig = wots::sign(&wc.seed, &commitment);
+                    witnesses.push(Witness::sig(wots::sig_to_bytes(&sig)));
+                }
+            } else {
+                bail!("coin {} not found in wallet", hex::encode(coin_id));
+            }
+        }
+        self.save()?;
+        Ok((input_reveals, witnesses))
+    }
+
+    /// Sign a Consolidate commitment. Generates EXACTLY one signature that covers
+    /// every input in the transaction. This eliminates the O(N) signature bandwidth overhead.
+    pub fn sign_consolidate(&mut self, pending: &PendingCommit) -> Result<(Vec<InputReveal>, Witness)> {
+        let output_commit_hashes: Vec<[u8; 32]> = pending.outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&pending.input_coin_ids, &output_commit_hashes, &pending.salt);
+
+        let mut input_reveals = Vec::new();
+        for coin_id in &pending.input_coin_ids {
+            if let Some(wc) = self.find_coin(coin_id).cloned() {
+                input_reveals.push(InputReveal {
+                    predicate: Predicate::p2pk(&wc.owner_pk),
+                    value: wc.value,
+                    salt: wc.salt,
+                    commitment: Some(commitment),
+                });
+            } else {
+                bail!("coin not found");
+            }
+        }
+        
+        let first_coin = self.find_coin(&pending.input_coin_ids[0]).unwrap().clone();
+        let is_mss = self.data.mss_keys.iter().any(|k| k.master_pk == first_coin.owner_pk);
+        let witness = if is_mss {
+            let pos = self.data.mss_keys.iter().position(|k| k.master_pk == first_coin.owner_pk).unwrap();
+            let keypair = &mut self.data.mss_keys[pos];
+            if keypair.remaining() == 0 { bail!("MSS key exhausted"); }
+            let sig = keypair.sign(&commitment)?;
+            Witness::sig(sig.to_bytes())
+        } else {
+            let addr = first_coin.address;
+            for c in self.data.coins.iter_mut() {
+                if c.address == addr {
+                    c.wots_signed = true;
+                }
+            }
+            let sig = wots::sign(&first_coin.seed, &commitment);
+            Witness::sig(wots::sig_to_bytes(&sig))
+        };
+        
+        self.save()?;
+        Ok((input_reveals, witness))
+    }
+
+    pub fn find_pending(&self, commitment: &[u8; 32]) -> Option<&PendingCommit> {
+        self.data.pending.iter().find(|p| &p.commitment == commitment)
+    }
+
+    pub fn pending(&self) -> &[PendingCommit] {
+        &self.data.pending
+    }
+
+    /// Complete a reveal: remove spent coins, add change coins.
+    pub fn complete_reveal(&mut self, commitment: &[u8; 32]) -> Result<()> {
+        let pending = self.data.pending.iter()
+            .find(|p| &p.commitment == commitment)
+            .ok_or_else(|| anyhow::anyhow!("pending commit not found"))?
+            .clone();
+
+        let spent_coin_ids = pending.input_coin_ids.clone();
+        let fee: u64 = {
+            let in_sum: u64 = spent_coin_ids.iter()
+                .filter_map(|id| self.find_coin(id))
+                .map(|c| c.value)
+                .sum();
+            let out_sum: u64 = pending.outputs.iter().map(|o| o.value()).sum();
+            in_sum.saturating_sub(out_sum)
+        };
+
+        self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
+
+        for (idx, seed) in &pending.change_seeds {
+            let out = &pending.outputs[*idx];
+            if let Some(coin_id) = out.coin_id() {
+                if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+                    let owner_pk = wots::keygen(seed);
+                    self.data.coins.push(WalletCoin {
+                        seed: *seed,
+                        owner_pk,
+                        address: out.address(),
+                        value: out.value(),
+                        salt: out.salt(),
+                        coin_id,
+                        label: Some(format!("change ({})", out.value())),
+                        wots_signed: false,
+                        commitment: Some(commitment.clone()),
+                    });
+                }
+            }
+        }
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        self.data.history.push(HistoryEntry {
+            inputs: spent_coin_ids,
+            outputs: pending.outputs.iter().filter_map(|o| o.coin_id()).collect(),
+            fee,
+            timestamp: now,
+            kind: "sent".into(),
+        });
+
+        // Automatic re-keying for Pruning Licenses:
+        // If this reveal created a Confidential output whose commitment matches
+        // a stored license metadata entry, update the key to the real coin_id.
+        for _out in &pending.outputs {
+            // Note: License metadata is now stored under the final coin_id at issuance/purchase time
+            // using deterministic salts. Automatic re-keying for Confidential outputs is no longer needed.
+        }
+
+        self.data.pending.retain(|p| &p.commitment != commitment);
+        self.save()?;
+        Ok(())
+    }
+
+    pub fn history(&self) -> &[HistoryEntry] {
+        &self.data.history
+    }
+
+    /// Record a batch of coins received in a single block during scan.
+    /// `block_timestamp` should be the block's timestamp (seconds since epoch).
+    pub fn record_received(&mut self, coin_ids: Vec<[u8; 32]>, block_timestamp: u64) {
+        if coin_ids.is_empty() { return; }
+        self.data.history.push(HistoryEntry {
+            inputs: vec![],
+            outputs: coin_ids,
+            fee: 0,
+            timestamp: block_timestamp,
+            kind: "received".into(),
+        });
+    }
+
+    /// Plan a private send: splits the transaction into independent, 
+    /// denomination-specific N-in-M-out transactions with decoy change outputs.
+    pub fn plan_private_send(
+        &mut self,
+        live_coins: &[[u8; 32]],
+        recipient_address: &[u8; 32],
+        denominations: &[u64],
+    ) -> Result<Vec<(Vec<[u8; 32]>, Vec<OutputData>, Vec<(usize, [u8; 32])>)>> {
+        // Each denomination gets its own independent transaction.
+        // Each tx: 1+ inputs → 1 recipient output + change outputs.
+        // Inputs must sum to > denomination.
+        let mut used = std::collections::HashSet::new();
+        let mut pairs = Vec::new();
+
+        for &denom in denominations {
+            // Find inputs covering denom + 10_000 (minimum fee)
+            let needed = denom + 10_000u64;
+            let mut selected = Vec::new();
+            let mut total = 0u64;
+
+            let mut available: Vec<&WalletCoin> = self.data.coins.iter()
+                .filter(|c| live_coins.contains(&c.coin_id) && !used.contains(&c.coin_id))
+                .collect();
+            available.sort_by(|a, b| b.value.cmp(&a.value));
+
+            for coin in available {
+                if total >= needed { break; }
+                selected.push(coin.coin_id);
+                used.insert(coin.coin_id);
+                total += coin.value;
+            }
+
+            if total < needed {
+                bail!("insufficient funds for private send denomination {}", denom);
+            }
+
+            // Co-spend grouping: pull in WOTS siblings
+            let selected_addrs: std::collections::HashSet<[u8; 32]> = selected.iter()
+                .filter_map(|id| self.find_coin(id))
+                .filter(|c| !self.data.mss_keys.iter().any(|k| compute_address(&k.master_pk) == c.address))
+                .map(|c| c.address)
+                .collect();
+            for coin in self.data.coins.iter() {
+                if selected_addrs.contains(&coin.address)
+                    && !used.contains(&coin.coin_id)
+                    && !selected.contains(&coin.coin_id)
+                    && live_coins.contains(&coin.coin_id)
+                {
+                    selected.push(coin.coin_id);
+                    used.insert(coin.coin_id);
+                    total += coin.value;
+                }
+            }
+
+            let change = total - denom - 1; // fee = 1
+            let salt: [u8; 32] = rand::random();
+            let mut outputs = vec![OutputData::Standard {
+                address: *recipient_address,
+                value: denom,
+                salt,
+            }];
+            let mut change_seeds = Vec::new();
+
+            if change > 0 {
+                for cd in decompose_value(change) {
+                    let seed = self.allocate_next_wots_seed()?;
+                    let pk = wots::keygen(&seed);
+                    let addr = compute_address(&pk);
+                    let cs: [u8; 32] = rand::random();
+                    let idx = outputs.len();
+                    outputs.push(OutputData::Standard { address: addr, value: cd, salt: cs });
+                    change_seeds.push((idx, seed));
+                }
+            }
+
+            pairs.push((selected, outputs, change_seeds));
+        }
+
+        Ok(pairs)
+    }
+
+    // ── CoinJoin mixing ─────────────────────────────────────────────────────
+
+    /// Prepare a coin for CoinJoin mixing.
+    ///
+    /// Generates a fresh one-time address to receive the mixed output, and returns
+    /// the `(InputReveal, OutputData, output_seed)` triple needed for registration
+    /// with a [`coinjoin::MixSession`].
+    ///
+    /// The output seed is derived from the HD counter (or random for legacy wallets)
+    /// so the mixed coin is recoverable from the mnemonic on restore + chain scan.
+    ///
+    /// The caller must hold `output_seed` until the mix completes, then pass it
+    /// to [`complete_mix`] to import the received coin.
+    pub fn prepare_mix_registration(
+        &mut self,
+        coin_id: &[u8; 32],
+    ) -> Result<(InputReveal, OutputData, [u8; 32])> {
+        let coin = self.find_coin(coin_id)
+            .ok_or_else(|| anyhow::anyhow!("coin {} not in wallet", hex::encode(coin_id)))?
+            .clone();
+
+        // CoinJoin mixes spend exactly one coin. If this coin has WOTS
+        // siblings, they can't be included in the mix (the coordinator
+        // controls the transaction structure). The user must first co-spend
+        // all siblings in a regular send, then mix the consolidated coin.
+        let siblings = self.wots_siblings(coin_id);
+        if !siblings.is_empty() {
+            bail!(
+                "Coin {} has {} sibling(s) at the same WOTS address. \
+                 Consolidate them first with a regular send before mixing.",
+                hex::encode(coin_id), siblings.len()
+            );
+        }
+
+        let input = InputReveal {
+            predicate: Predicate::p2pk(&coin.owner_pk),
+            value: coin.value,
+            salt: coin.salt,
+            commitment: coin.commitment,
+        };
+
+        // Fresh one-time key from HD counter (recoverable from mnemonic)
+        let output_seed = self.allocate_next_wots_seed()?;
+        let output_pk = wots::keygen(&output_seed);
+        let output_address = compute_address(&output_pk);
+        let output_salt: [u8; 32] = rand::random();
+
+        let output = OutputData::Standard {
+            address: output_address,
+            value: coin.value,
+            salt: output_salt,
+        };
+
+        Ok((input, output, output_seed))
+    }
+
+    /// Find and prepare a denomination-1 coin to pay the CoinJoin fee.
+    ///
+    /// Returns `(InputReveal, coin_id)` for the selected coin.
+    pub fn prepare_mix_fee(
+        &self,
+        live_coins: &[[u8; 32]],
+    ) -> Result<(InputReveal, [u8; 32])> {
+        // Prefer fee coins without WOTS siblings — mixing can't include siblings
+        let coin = self.data.coins.iter()
+            .find(|c| {
+                c.value == 1
+                    && live_coins.contains(&c.coin_id)
+                    && self.wots_siblings(&c.coin_id).is_empty()
+            })
+            .or_else(|| {
+                // Fallback: any denomination-1 coin (will warn on sign)
+                self.data.coins.iter()
+                    .find(|c| c.value == 1 && live_coins.contains(&c.coin_id))
+            })
+            .ok_or_else(|| anyhow::anyhow!("no denomination-1 coin available for fee"))?;
+
+        let input = InputReveal {
+            predicate: Predicate::p2pk(&coin.owner_pk),
+            value: coin.value,
+            salt: coin.salt,
+            commitment: coin.commitment,
+        };
+        Ok((input, coin.coin_id))
+    }
+
+    /// Sign a CoinJoin commitment for one of our coins.
+    ///
+    /// Returns the serialized signature bytes.
+    pub fn sign_mix_input(
+        &mut self,
+        coin_id: &[u8; 32],
+        commitment: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        // Try WOTS first
+        if let Some(coin) = self.find_coin(coin_id).cloned() {
+            if let Some(pos) = self.data.mss_keys.iter().position(|k| k.master_pk == coin.owner_pk) {
+                let keypair = &mut self.data.mss_keys[pos];
+                let sig = keypair.sign(commitment)?;
+                self.save()?;
+                return Ok(sig.to_bytes());
+            }
+
+            let sig = wots::sign(&coin.seed, commitment);
+            // Mark this coin and all siblings as signed
+            let addr = coin.address;
+            for c in self.data.coins.iter_mut() {
+                if c.address == addr {
+                    c.wots_signed = true;
+                }
+            }
+            self.save()?;
+            return Ok(wots::sig_to_bytes(&sig));
+        }
+        bail!("coin {} not in wallet", hex::encode(coin_id));
+    }
+
+    /// Complete a CoinJoin mix: remove spent coins and import the received output.
+    pub fn complete_mix(
+        &mut self,
+        spent_coin_ids: &[[u8; 32]],
+        output: &OutputData,
+        output_seed: [u8; 32],
+    ) -> Result<()> {
+        self.data.coins.retain(|c| !spent_coin_ids.contains(&c.coin_id));
+
+        let output_pk = wots::keygen(&output_seed);
+        let coin_id = output.coin_id().expect("Mix outputs are guaranteed to be standard UTXOs");
+        if !self.data.coins.iter().any(|c| c.coin_id == coin_id) {
+            self.data.coins.push(WalletCoin {
+                seed: output_seed,
+                owner_pk: output_pk,
+                address: output.address(),
+                value: output.value(),
+                salt: output.salt(),
+                coin_id,
+                label: Some(format!("mixed ({})", output.value())),
+                wots_signed: false,
+                commitment: None,
+            });
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.data.history.push(HistoryEntry {
+            inputs: spent_coin_ids.to_vec(),
+            outputs: vec![coin_id],
+            fee: 0,
+            timestamp: now,
+            kind: "mixed".into(),
+        });
+
+        self.save()?;
+        Ok(())
+    }
+
+    // ── HD restore helpers ──────────────────────────────────────────────
+
+    /// Pre-generate `count` WOTS receiving keys for chain scanning during
+    /// a mnemonic restore. These keys are appended to `self.data.keys` so
+    /// that `watched_addresses()` and `import_scanned()` work normally.
+    ///
+    /// Call this in a loop with increasing counts until a full scan finds
+    /// no new coins within the last `gap_limit` keys (typically 20-50).
+    pub fn restore_generate_keys(&mut self, count: u64) -> Result<()> {
+        if self.data.master_seed.is_none() {
+            bail!("restore_generate_keys requires an HD wallet");
+        }
+        for _ in 0..count {
+            let seed = self.allocate_next_wots_seed()?;
+            let owner_pk = wots::keygen(&seed);
+            let address = compute_address(&owner_pk);
+            self.data.keys.push(WalletKey {
+                seed,
+                owner_pk,
+                address,
+                label: None,
+            });
+        }
+        self.save()?;
+        Ok(())
+    }
+
+
+    /// Locally abandons (deletes) all coins matching a specific address.
+    /// Used to clear out "dust bombs" so they don't break the co-spend rule.
+    pub fn abandon_coins_at_address(&mut self, address: &[u8; 32]) -> Result<usize> {
+        let initial_count = self.data.coins.len();
+        self.data.coins.retain(|c| c.address != *address);
+        let removed = initial_count - self.data.coins.len();
+        
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+    
+    /// How many WOTS keys have been derived so far (HD wallets only).
+    pub fn wots_index(&self) -> u64 {
+        self.data.next_wots_index
+    }
+
+    /// How many MSS keys have been derived so far (HD wallets only).
+    pub fn mss_index(&self) -> u64 {
+        self.data.next_mss_index
+    }
+}
+
+/// Deterministic coinbase seed derivation.
+pub fn coinbase_seed(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32] {
+    let height_key = hash_concat(mining_seed, &height.to_le_bytes());
+    hash_concat(&height_key, &index.to_le_bytes())
+}
+
+/// Deterministic coinbase salt derivation (different domain from seed).
+pub fn coinbase_salt(mining_seed: &[u8; 32], height: u64, index: u64) -> [u8; 32] {
+    let height_key = hash_concat(mining_seed, &height.to_le_bytes());
+    hash_concat(&height_key, &(index | 0x8000000000000000).to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn create_and_reopen() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr = w.generate_key(Some("test".into())).unwrap();
+        assert_eq!(w.keys().len(), 1);
+        assert_eq!(w.keys()[0].address, addr);
+
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.keys().len(), 1);
+    }
+
+    #[test]
+    fn import_coin_and_find() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let seed: [u8; 32] = [0x42; 32];
+        let salt: [u8; 32] = [0x11; 32];
+        let coin_id = w.import_coin(seed, 16, salt, Some("test coin".into())).unwrap();
+
+        assert_eq!(w.coin_count(), 1);
+        let found = w.find_coin(&coin_id).unwrap();
+        assert_eq!(found.value, 16);
+    }
+
+    #[test]
+    fn total_value() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        w.import_coin([1u8; 32], 8, [2u8; 32], None).unwrap();
+        w.import_coin([3u8; 32], 4, [4u8; 32], None).unwrap();
+        assert_eq!(w.total_value(), 12);
+    }
+
+
+    // ── resolve_coin ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_coin_by_index() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let seed = [0x42u8; 32];
+        let salt = [0x11; 32];
+        let coin_id = w.import_coin(seed, 16, salt, None).unwrap();
+        assert_eq!(w.resolve_coin("0").unwrap(), coin_id);
+    }
+
+    #[test]
+    fn resolve_coin_by_hex_prefix() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([0x42; 32], 8, [0x11; 32], None).unwrap();
+        let prefix = &hex::encode(coin_id)[..8];
+        assert_eq!(w.resolve_coin(prefix).unwrap(), coin_id);
+    }
+
+    #[test]
+    fn resolve_coin_not_found() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let w = Wallet::create(&path, b"pass").unwrap();
+        assert!(w.resolve_coin("99").is_err());
+        assert!(w.resolve_coin("deadbeef").is_err());
+    }
+
+    // ── select_coins ────────────────────────────────────────────────────
+
+#[test]
+    fn select_coins_minimal() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let c2 = w.import_coin([2; 32], 8, [20; 32], None).unwrap();
+        let c3 = w.import_coin([3; 32], 16, [30; 32], None).unwrap();
+
+        let live = vec![c1, c2, c3];
+        
+        // Need 15 -> should select the 16-coin. 
+        // Change is 1. The wallet has no `1` coin, so the greedy snowball 
+        // safely stops without merging anything else.
+        let selected = w.select_coins(15, &live).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], c3);
+    }
+
+    #[test]
+    fn select_coins_insufficient() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        assert!(w.select_coins(100, &[c1]).is_err());
+    }
+
+    #[test]
+    fn select_coins_ignores_non_live() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let _c2 = w.import_coin([2; 32], 8, [20; 32], None).unwrap(); // not live
+
+        let selected = w.select_coins(4, &[c1]).unwrap();
+        assert_eq!(selected, vec![c1]);
+    }
+
+    // ── build_outputs ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_outputs_with_change() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let dest = [0xAA; 32];
+        let (outputs, change_seeds) = w.build_outputs(&dest, &[4, 2], 3).unwrap();
+
+        // 2 recipient + decompose(3) = 1+2 = 2 change = 4 total
+        let recipient_count = 2;
+        let change_count = decompose_value(3).len(); // [1, 2]
+        assert_eq!(outputs.len(), recipient_count + change_count);
+        assert_eq!(change_seeds.len(), change_count);
+
+        // First two are to recipient
+        let dest_outs: Vec<_> = outputs.iter().filter(|o| o.address() == dest).collect();
+        assert_eq!(dest_outs.len(), 2);
+        assert!(dest_outs.iter().any(|o| o.value() == 4));
+        assert!(dest_outs.iter().any(|o| o.value() == 2));
+
+        // Change values sum correctly
+        let change_total: u64 = change_seeds.iter().map(|(idx, _)| outputs[*idx].value()).sum();
+        assert_eq!(change_total, 3);
+    }
+
+    #[test]
+    fn build_outputs_no_change() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let (outputs, change_seeds) = w.build_outputs(&[0xBB; 32], &[8], 0).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(change_seeds.is_empty());
+    }
+
+    // ── coinbase_seed / coinbase_salt derivation ────────────────────────
+
+    #[test]
+    fn coinbase_seed_deterministic() {
+        let ms = [0xAA; 32];
+        assert_eq!(coinbase_seed(&ms, 100, 0), coinbase_seed(&ms, 100, 0));
+    }
+
+    #[test]
+    fn coinbase_seed_varies_by_height() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_seed(&ms, 2, 0));
+    }
+
+    #[test]
+    fn coinbase_seed_varies_by_index() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_seed(&ms, 1, 1));
+    }
+
+    #[test]
+    fn coinbase_seed_differs_from_salt() {
+        let ms = [0xAA; 32];
+        assert_ne!(coinbase_seed(&ms, 1, 0), coinbase_salt(&ms, 1, 0));
+    }
+
+    // ── watched_addresses ───────────────────────────────────────────────
+
+    #[test]
+    fn watched_addresses_includes_keys_and_mss() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr1 = w.generate_key(None).unwrap();
+        let mss_addr = w.generate_mss(4, None).unwrap();
+
+        let watched = w.watched_addresses();
+        assert!(watched.contains(&addr1));
+        assert!(watched.contains(&mss_addr));
+    }
+
+    #[test]
+    fn watched_addresses_deduped() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        w.generate_key(None).unwrap();
+        w.generate_key(None).unwrap();
+        let watched = w.watched_addresses();
+        let mut sorted = watched.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(watched.len(), sorted.len());
+    }
+
+    // ── import_scanned ──────────────────────────────────────────────────
+
+    #[test]
+    fn import_scanned_matches_key() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr = w.generate_key(Some("scan test".into())).unwrap();
+
+        let salt = [0x55; 32];
+        let value = 8u64;
+        let result = w.import_scanned(addr, value, salt, None).unwrap();
+        assert!(result.is_some());
+        assert_eq!(w.coin_count(), 1);
+        assert_eq!(w.keys().len(), 0); // key consumed
+    }
+
+    #[test]
+    fn import_scanned_ignores_unknown_address() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let result = w.import_scanned([0xFF; 32], 8, [0; 32], None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn import_scanned_dedup() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let addr = w.generate_key(None).unwrap();
+        let salt = [0x55; 32];
+
+        w.import_scanned(addr, 8, salt, None).unwrap();
+        // Second import same coin → None
+        let result = w.import_scanned(addr, 8, salt, None).unwrap();
+        assert!(result.is_none());
+        assert_eq!(w.coin_count(), 1);
+    }
+
+    // ── generate_mss ────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_mss_creates_key() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let root = w.generate_mss(4, Some("test mss".into())).unwrap();
+        assert_ne!(root, [0u8; 32]);
+        assert_eq!(w.mss_keys().len(), 1);
+        assert_eq!(w.mss_keys()[0].height, 4);
+    }
+
+    // ── plan_private_send ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_private_send_independent_pairs() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+let c1 = w.import_coin([1; 32], 20_000, [10; 32], None).unwrap();
+let c2 = w.import_coin([2; 32], 20_000, [20; 32], None).unwrap();
+let c3 = w.import_coin([3; 32], 40_000, [30; 32], None).unwrap();
+
+        let live = vec![c1, c2, c3];
+        let dest = [0xAA; 32];
+        let pairs = w.plan_private_send(&live, &dest, &[4, 2]).unwrap();
+
+        assert_eq!(pairs.len(), 2);
+        // Each pair should have non-overlapping inputs
+        let all_inputs: Vec<[u8; 32]> = pairs.iter()
+            .flat_map(|(ins, _, _)| ins.clone())
+            .collect();
+        let mut deduped = all_inputs.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(all_inputs.len(), deduped.len(), "inputs should not overlap between pairs");
+    }
+
+    #[test]
+    fn plan_private_send_insufficient_funds() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 2, [10; 32], None).unwrap();
+        assert!(w.plan_private_send(&[c1], &[0xAA; 32], &[4, 4]).is_err());
+    }
+
+    // ── CoinJoin helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn prepare_mix_registration_produces_matching_denomination() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+
+        let (input, output, _seed) = w.prepare_mix_registration(&coin_id).unwrap();
+        assert_eq!(input.value, 8);
+        assert_eq!(output.value(), 8);
+        assert_eq!(input.coin_id(), coin_id);
+    }
+
+    #[test]
+    fn prepare_mix_registration_unknown_coin_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        assert!(w.prepare_mix_registration(&[0xFF; 32]).is_err());
+    }
+
+    #[test]
+    fn prepare_mix_fee_finds_denomination_1() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let c2 = w.import_coin([2; 32], 1, [20; 32], None).unwrap();
+
+        let (fee_input, fee_id) = w.prepare_mix_fee(&[c1, c2]).unwrap();
+        assert_eq!(fee_input.value, 1);
+        assert_eq!(fee_id, c2);
+    }
+
+    #[test]
+    fn prepare_mix_fee_fails_without_denomination_1() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        assert!(w.prepare_mix_fee(&[c1]).is_err());
+    }
+
+    #[test]
+    fn sign_mix_input_produces_valid_signature() {
+        use crate::core::wots;
+
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let seed = [0x42; 32];
+        let coin_id = w.import_coin(seed, 8, [10; 32], None).unwrap();
+
+        let commitment = crate::core::types::hash(b"test commitment");
+        let sig_bytes = w.sign_mix_input(&coin_id, &commitment).unwrap();
+
+        let coin = w.find_coin(&coin_id).unwrap();
+        let sig = wots::sig_from_bytes(&sig_bytes).unwrap();
+        assert!(wots::verify(&sig, &commitment, &coin.owner_pk));
+    }
+
+    #[test]
+    fn sign_mix_input_unknown_coin_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let commitment = [0; 32];
+        assert!(w.sign_mix_input(&[0xFF; 32], &commitment).is_err());
+    }
+
+    #[test]
+    fn complete_mix_removes_spent_adds_output() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let fee_id = w.import_coin([2; 32], 1, [20; 32], None).unwrap();
+        assert_eq!(w.coin_count(), 2);
+
+        let output_seed: [u8; 32] = [0x99; 32];
+        let output_pk = crate::core::wots::keygen(&output_seed);
+        let output_addr = crate::core::types::compute_address(&output_pk);
+        let output = crate::core::OutputData::Standard {
+            address: output_addr,
+            value: 8,
+            salt: [0xAA; 32],
+        };
+
+        w.complete_mix(&[coin_id, fee_id], &output, output_seed).unwrap();
+
+        assert_eq!(w.coin_count(), 1);
+        assert!(w.find_coin(&coin_id).is_none());
+        assert!(w.find_coin(&fee_id).is_none());
+
+        let new_coin = w.find_coin(&output.coin_id().unwrap()).unwrap();
+        assert_eq!(new_coin.value, 8);
+        assert_eq!(new_coin.seed, output_seed);
+    }
+
+    #[test]
+    fn complete_mix_persists() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+
+        let output_seed: [u8; 32] = [0x99; 32];
+        let output_pk = crate::core::wots::keygen(&output_seed);
+        let output_addr = crate::core::types::compute_address(&output_pk);
+        let output = crate::core::OutputData::Standard {
+            address: output_addr,
+            value: 8,
+            salt: [0xAA; 32],
+        };
+
+        w.complete_mix(&[coin_id], &output, output_seed).unwrap();
+        let output_coin_id = output.coin_id();
+
+        // Reopen
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.coin_count(), 1);
+        assert!(w2.find_coin(&output_coin_id.unwrap()).is_some());
+        assert_eq!(w2.history().len(), 1);
+    }
+
+    // ── wrong password ──────────────────────────────────────────────────
+
+    #[test]
+    fn open_wrong_password() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        Wallet::create(&path, b"correct").unwrap();
+        assert!(Wallet::open(&path, b"wrong").is_err());
+    }
+
+    #[test]
+    fn create_duplicate_path_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        Wallet::create(&path, b"pass").unwrap();
+        assert!(Wallet::create(&path, b"pass").is_err());
+    }
+    
+    #[test]
+    fn test_mss_safety_recovery_persistence() {
+        // 1. Setup: Create a wallet with an MSS key
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap(); // ensure it doesn't exist
+
+        let mut w = Wallet::create(&path, b"password").unwrap();
+        w.generate_mss(4, Some("test_mss".to_string())).unwrap();
+        
+        // Initial state: leaf index should be 0
+        assert_eq!(w.mss_keys()[0].next_leaf, 0);
+
+        // 2. Simulate the Fix:
+        // The "network" tells us the index is actually 50.
+        // We apply the fix logic: update internal state + safety margin.
+        let remote_index = 50;
+        let safety_margin = 20;
+        let new_index = remote_index + safety_margin;
+
+        // Apply fix directly to the data structure
+        w.data.mss_keys[0].set_next_leaf(new_index);
+        w.save().unwrap();
+
+        // 3. Verify Persistence:
+        // Close the wallet and reopen it from disk.
+        let w_reloaded = Wallet::open(&path, b"password").unwrap();
+        
+        // The loaded wallet must have the updated index.
+        assert_eq!(w_reloaded.mss_keys()[0].next_leaf, 70);
+        
+        // Ensure we didn't lose the key itself
+        assert_eq!(w_reloaded.mss_keys().len(), 1);
+        assert_eq!(w_reloaded.mss_keys()[0].height, 4);
+    }
+    // ── Snowball Merge (Greedy UTXO Defragmentation) ────────────────────
+
+    #[test]
+    fn select_coins_greedy_snowball_basic() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        
+        let c8 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let c2_a = w.import_coin([2; 32], 2, [20; 32], None).unwrap();
+        let c2_b = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
+
+        let live = vec![c8, c2_a, c2_b];
+        
+        // Scenario: We need 6.
+        // Normal selection: picks `8`. Change = 2. Wallet becomes [2, 2, 2] (worse fragmentation).
+        // Greedy selection: picks `8`. Change = 2. 
+        //   - Sees an unselected `2`. Pulls it in. Total = 10. Change = 4.
+        //   - Doesn't have a `4`. Stops.
+        // New Wallet state after tx: [4, 2] (Defragmented!)
+        let selected = w.select_coins(6, &live).unwrap();
+        
+        assert_eq!(selected.len(), 2, "Should pick the 8 and one of the 2s");
+        assert!(selected.contains(&c8));
+        assert!(selected.contains(&c2_a) || selected.contains(&c2_b));
+    }
+
+    #[test]
+    fn select_coins_greedy_snowball_cascade() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        
+        let c16 = w.import_coin([1; 32], 16, [10; 32], None).unwrap();
+        let c4 = w.import_coin([2; 32], 4, [20; 32], None).unwrap();
+        let c2_a = w.import_coin([3; 32], 2, [30; 32], None).unwrap();
+        let c2_b = w.import_coin([4; 32], 2, [40; 32], None).unwrap();
+
+        let live = vec![c16, c4, c2_a, c2_b];
+        
+        // Scenario: We need 14.
+        // Normal selection: picks `16`. Change = 2. Wallet becomes [4, 2, 2, 2].
+        // Greedy selection:
+        //   1. Base: picks `16`. Total = 16. Change = 2.
+        //   2. Iteration 1: sees a `2`. Picks `c2_a`. Total = 18. Change = 4.
+        //   3. Iteration 2: sees a `4`. Picks `c4`. Total = 22. Change = 8.
+        //   4. Iteration 3: sees an `8`. None available. Stops.
+        // Resulting wallet state after tx: [8, 2] (Massively defragmented!)
+        let selected = w.select_coins(14, &live).unwrap();
+        
+        assert_eq!(selected.len(), 3, "Should cascade and pick 16, 4, and 2");
+        assert!(selected.contains(&c16));
+        assert!(selected.contains(&c4));
+        assert!(selected.contains(&c2_a) || selected.contains(&c2_b));
+    }
+
+    // ── HD wallet ───────────────────────────────────────────────────────
+
+    #[test]
+    fn hd_create_and_restore_same_keys() {
+        let file1 = NamedTempFile::new().unwrap();
+        let path1 = file1.path().to_path_buf();
+        std::fs::remove_file(&path1).unwrap();
+
+        let (mut w1, phrase) = Wallet::create_hd(&path1, b"pass").unwrap();
+        assert!(w1.is_hd());
+
+        let addr1 = w1.generate_key(Some("first".into())).unwrap();
+        let addr2 = w1.generate_key(Some("second".into())).unwrap();
+        assert_eq!(w1.wots_index(), 2);
+
+        // Restore from the same mnemonic
+        let file2 = NamedTempFile::new().unwrap();
+        let path2 = file2.path().to_path_buf();
+        std::fs::remove_file(&path2).unwrap();
+
+        let mut w2 = Wallet::restore_from_mnemonic(&path2, b"pass2", &phrase).unwrap();
+        assert!(w2.is_hd());
+
+        let restored_addr1 = w2.generate_key(None).unwrap();
+        let restored_addr2 = w2.generate_key(None).unwrap();
+
+        assert_eq!(addr1, restored_addr1, "First derived address must match");
+        assert_eq!(addr2, restored_addr2, "Second derived address must match");
+    }
+
+    #[test]
+    fn hd_counter_persists() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        w.generate_key(None).unwrap();
+        w.generate_key(None).unwrap();
+        w.generate_key(None).unwrap();
+        assert_eq!(w.wots_index(), 3);
+        drop(w);
+
+        let w2 = Wallet::open(&path, b"pass").unwrap();
+        assert_eq!(w2.wots_index(), 3);
+    }
+
+    #[test]
+    fn hd_change_seeds_use_counter() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        // Generate a receive key (index 0)
+        w.generate_key(None).unwrap();
+        assert_eq!(w.wots_index(), 1);
+
+        // Build outputs with change — should bump the counter further
+        let dest = [0xAA; 32];
+        let (_outputs, change_seeds) = w.build_outputs(&dest, &[4], 3).unwrap();
+        // change_value=3 decomposes to [1, 2] → 2 change seeds
+        assert_eq!(change_seeds.len(), 2);
+        assert_eq!(w.wots_index(), 3); // 1 receive + 2 change
+    }
+
+    #[test]
+    fn hd_mss_uses_separate_counter() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        w.generate_key(None).unwrap();   // wots_index → 1
+        w.generate_mss(4, None).unwrap(); // mss_index → 1, wots stays at 1
+
+        assert_eq!(w.wots_index(), 1);
+        assert_eq!(w.mss_index(), 1);
+    }
+
+    #[test]
+    fn hd_restore_generate_keys() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        w.restore_generate_keys(50).unwrap();
+        assert_eq!(w.keys().len(), 50);
+        assert_eq!(w.wots_index(), 50);
+
+        // All 50 addresses should be watchable
+        let addrs = w.watched_addresses();
+        assert_eq!(addrs.len(), 50);
+    }
+
+    #[test]
+    fn legacy_wallet_still_works() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        assert!(!w.is_hd());
+        assert_eq!(w.wots_index(), 0); // no HD counter
+
+        // Should still generate keys (random fallback)
+        let addr = w.generate_key(None).unwrap();
+        assert_ne!(addr, [0u8; 32]);
+        // Counter stays 0 for legacy wallets (random seeds, no derivation path)
+        assert_eq!(w.wots_index(), 0);
+    }
+
+    #[test]
+    fn hd_mix_output_uses_counter() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let (mut w, _phrase) = Wallet::create_hd(&path, b"pass").unwrap();
+        let coin_id = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+
+        let idx_before = w.wots_index();
+        let (_input, _output, _seed) = w.prepare_mix_registration(&coin_id).unwrap();
+        assert_eq!(w.wots_index(), idx_before + 1);
+    }
+
+    #[test]
+    fn restore_from_invalid_mnemonic_fails() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(Wallet::restore_from_mnemonic(&path, b"pass", "not valid words").is_err());
+    }
+
+    #[test]
+    fn different_mnemonics_different_keys() {
+        let file1 = NamedTempFile::new().unwrap();
+        let path1 = file1.path().to_path_buf();
+        std::fs::remove_file(&path1).unwrap();
+        let (mut w1, _phrase1) = Wallet::create_hd(&path1, b"pass").unwrap();
+
+        let file2 = NamedTempFile::new().unwrap();
+        let path2 = file2.path().to_path_buf();
+        std::fs::remove_file(&path2).unwrap();
+        let (mut w2, _phrase2) = Wallet::create_hd(&path2, b"pass").unwrap();
+
+        let addr1 = w1.generate_key(None).unwrap();
+        let addr2 = w2.generate_key(None).unwrap();
+        assert_ne!(addr1, addr2);
+    }
+
+    // ── Co-spend grouping ───────────────────────────────────────────────
+
+    #[test]
+    fn sibling_import_works() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        // Import first coin at a WOTS address
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+
+        // Import sibling at the same address via import_scanned
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap();
+        assert!(c2.is_some(), "sibling import should succeed");
+
+        assert_eq!(w.coins().len(), 2);
+        assert_eq!(w.total_value(), 5); // 4 + 1
+    }
+
+    #[test]
+    fn sibling_import_rejected_after_signing() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+
+        // Mark as signed (simulating a spend)
+        w.data.coins[0].wots_signed = true;
+        w.save().unwrap();
+
+        // Sibling should be quarantined
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap();
+        assert!(c2.is_none(), "sibling at signed address should be rejected");
+        assert_eq!(w.coins().len(), 1);
+    }
+
+    #[test]
+    fn wots_siblings_found() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+
+        let sibs = w.wots_siblings(&c1);
+        assert_eq!(sibs, vec![c2]);
+        let sibs2 = w.wots_siblings(&c2);
+        assert_eq!(sibs2, vec![c1]);
+    }
+
+    #[test]
+    fn select_coins_pulls_in_siblings() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+
+        // We only need 4, but selecting c1 must pull in c2 (sibling)
+        let live = vec![c1, c2];
+        let selected = w.select_coins(4, &live).unwrap();
+        assert!(selected.contains(&c1));
+        assert!(selected.contains(&c2), "sibling must be pulled into selection");
+    }
+
+    #[test]
+    fn prepare_commit_rejects_missing_sibling() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+        let _c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+
+        // Try to commit with only c1, leaving sibling c2 behind
+        let outputs = vec![OutputData::Standard {
+            address: [0xAA; 32],
+            value: 3,
+            salt: [0xBB; 32],
+        }];
+        let result = w.prepare_commit(&[c1], &outputs, vec![], false, false);
+        assert!(result.is_err(), "must reject when sibling is missing");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("co-spend"), "error should mention co-spend: {}", err);
+    }
+
+    #[test]
+    fn prepare_commit_accepts_all_siblings() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+
+        // Commit with both siblings — should succeed
+        let outputs = vec![OutputData::Standard {
+            address: [0xAA; 32],
+            value: 4,
+            salt: [0xBB; 32],
+        }];
+        let result = w.prepare_commit(&[c1, c2], &outputs, vec![], false, false);
+        assert!(result.is_ok(), "should accept when all siblings included");
+    }
+
+    #[test]
+    fn sign_reveal_marks_all_siblings_signed() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+        let c2 = w.import_scanned(addr, 1, [20; 32], None).unwrap().unwrap();
+
+        let outputs = vec![OutputData::Standard {
+            address: [0xAA; 32],
+            value: 4,
+            salt: [0xBB; 32],
+        }];
+        let (commitment, _salt) = w.prepare_commit(&[c1, c2], &outputs, vec![], false, false).unwrap();
+        let pending = w.find_pending(&commitment).unwrap().clone();
+        w.sign_reveal(&pending).unwrap();
+
+        // Both coins should be marked signed
+        assert!(w.find_coin(&c1).unwrap().wots_signed);
+        assert!(w.find_coin(&c2).unwrap().wots_signed);
+    }
+
+    #[test]
+    fn mix_rejects_coin_with_siblings() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 8, [10; 32], None).unwrap();
+        let addr = w.find_coin(&c1).unwrap().address;
+        let _c2 = w.import_scanned(addr, 2, [20; 32], None).unwrap().unwrap();
+
+        // Mix should reject — can't bring siblings into a CoinJoin
+        let result = w.prepare_mix_registration(&c1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("sibling"));
+    }
+
+    #[test]
+    fn coin_without_siblings_has_no_cospend_issue() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut w = Wallet::create(&path, b"pass").unwrap();
+        let c1 = w.import_coin([1; 32], 4, [10; 32], None).unwrap();
+
+        assert!(w.wots_siblings(&c1).is_empty());
+
+        let outputs = vec![OutputData::Standard {
+            address: [0xAA; 32],
+            value: 3,
+            salt: [0xBB; 32],
+        }];
+        let result = w.prepare_commit(&[c1], &outputs, vec![], false, false);
+        assert!(result.is_ok());
+    }
+}

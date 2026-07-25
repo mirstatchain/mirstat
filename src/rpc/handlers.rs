@@ -1,0 +1,1749 @@
+use super::types::*;
+use crate::core::{compute_coin_id, compute_address, wots,
+                  block_reward, Transaction, InputReveal, OutputData, Predicate, Witness};
+use crate::node::NodeHandle;
+use blake3;
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{StatusCode,header},
+    response::{IntoResponse, Response},
+    Json,
+};
+
+type AppState = NodeHandle;
+
+impl IntoResponse for ErrorResponse {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+    }
+}
+
+pub async fn health() -> &'static str {
+    "OK"
+}
+
+pub async fn get_mss_state(State(node): State<AppState>, Json(req): Json<GetMssStateRequest>)
+    -> Result<Json<GetMssStateResponse>, ErrorResponse> {
+    let master_pk = parse_hex32(&req.master_pk, "master_pk")?;
+    let chain_max = node.storage.query_mss_leaf_index(&master_pk).unwrap_or(0);  
+    let (_, mempool_txs) = node.get_mempool_info().await;
+    let mempool_max = crate::node::scan_txs_for_mss_index(&mempool_txs, &master_pk);
+    Ok(Json(GetMssStateResponse { next_index: chain_max.max(mempool_max) }))
+}
+
+pub async fn get_state(State(node): State<AppState>) -> Json<GetStateResponse> {
+    let state = node.get_state().await;
+    let safe_depth = node.get_safe_depth().await;
+    let required_pow = crate::mempool::Mempool::calculate_required_pow(state.commitments.len());
+     let webrtc_addrs = node.get_webrtc_addrs().await
+    .into_iter()
+    .filter(|addr| {
+        // Keep only addresses with public routable IPs
+        addr.parse::<libp2p::Multiaddr>().ok()
+            .map(|ma| crate::network::is_routable(&ma))
+            .unwrap_or(false)
+    })
+    .collect::<Vec<_>>();
+
+    Json(GetStateResponse {
+        height: state.height,
+        depth: state.depth,
+        safe_depth,
+        mirstat: hex::encode(state.mirstat),
+        num_coins: state.coins.len(),
+        num_commitments: state.commitments.len(),
+        target: hex::encode(state.target),
+        block_reward: block_reward(state.height),
+        required_pow,
+        webrtc_addrs, 
+        header_hash: hex::encode(state.header_hash),
+        is_syncing: node.is_syncing(),
+    })
+}
+
+fn parse_hex32(hex_str: &str, label: &str) -> Result<[u8; 32], ErrorResponse> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| ErrorResponse { error: format!("Invalid {} hex: {}", label, e) })?;
+    if bytes.len() != 32 {
+        return Err(ErrorResponse { error: format!("{} must be 32 bytes", label) });
+    }
+    Ok(<[u8; 32]>::try_from(bytes).unwrap())
+}
+
+pub async fn commit_transaction(
+    State(node): State<AppState>,
+    Json(req): Json<CommitRequest>,
+) -> Result<Json<CommitResponse>, ErrorResponse> {
+
+    let commitment = parse_hex32(&req.commitment, "commitment")?;
+
+    // Verify the client's PoW meets the current dynamic threshold
+    let (_, txs) = node.get_mempool_info().await;
+    let pending_commits = txs.iter().filter(|t| matches!(t, Transaction::Commit { .. })).count();
+    let required_pow = crate::mempool::Mempool::calculate_required_pow(pending_commits);
+
+    let state = node.get_state().await;
+    let actual_zeros = match crate::core::transaction::evaluate_commit_pow(&commitment, req.spam_nonce, &state) {
+        Ok(z) => z,
+        Err(e) => return Err(ErrorResponse { error: e.to_string() }),
+    };
+
+    if actual_zeros < required_pow {
+        return Err(ErrorResponse {
+            error: format!(
+                "Insufficient PoW: need {} leading zeros, got {}",
+                required_pow,
+                actual_zeros
+            ),
+        });
+    }
+
+    let tx = Transaction::Commit {
+        commitment,
+        spam_nonce: req.spam_nonce,
+    };
+
+    node.send_transaction(tx)
+        .await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(CommitResponse {
+        commitment: hex::encode(commitment),
+        status: "committed".to_string(),
+    }))
+}
+
+pub async fn send_transaction(
+    State(node): State<AppState>,
+    Json(req): Json<SendTransactionRequest>,
+) -> Result<Json<SendTransactionResponse>, ErrorResponse> {
+    if req.inputs.is_empty() {
+        return Err(ErrorResponse { error: "Must provide at least one input".into() });
+    }
+    // Consolidate transactions carry exactly ONE aggregated witness covering ALL
+    // inputs (enforced below when the Transaction is built). The per-input count
+    // rule only applies to standard Reveals — without this exemption, any
+    // consolidate with >1 input is rejected here before the consolidate branch
+    // is ever reached, making the two checks mutually unsatisfiable.
+    if !req.is_consolidate && req.signatures.len() != req.inputs.len() {
+        return Err(ErrorResponse {
+            error: "Signature count must match input count".into(),
+        });
+    }
+
+    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+        Ok(InputReveal {
+            predicate: Predicate::Script { 
+                bytecode: hex::decode(&i.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+            },
+            value: i.value,
+            salt: parse_hex32(&i.salt, "input_salt")?,
+            commitment: i.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
+        })
+    }).collect::<Result<_, ErrorResponse>>()?;
+
+    let mut witnesses = Vec::new();
+    for sig_string in &req.signatures {
+        let stack_items = sig_string.split(',')
+            .filter(|s| !s.is_empty())
+            .map(hex::decode)
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .map_err(|e| ErrorResponse { error: format!("Invalid hex in witness stack: {}", e) })?;
+        witnesses.push(Witness::ScriptInputs(stack_items));
+    }
+
+    let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
+        match o {
+            OutputDataJson::Standard { address, value, salt } => {
+                Ok(OutputData::Standard {
+                    address: parse_hex32(address, "address")?,
+                    value: *value,
+                    salt: parse_hex32(salt, "output_salt")?,
+                })
+            }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                Ok(OutputData::Confidential {
+                    address: parse_hex32(address, "address")?,
+                    commitment: parse_hex32(commitment, "commitment")?,
+                    salt: parse_hex32(salt, "output_salt")?,
+                })
+            }
+            OutputDataJson::DataBurn { payload, value_burned } => {
+                Ok(OutputData::DataBurn {
+                    payload: hex::decode(payload).map_err(|_| ErrorResponse { error: "Invalid payload hex".into() })?,
+                    value_burned: *value_burned,
+                })
+            }
+        }
+    }).collect::<Result<_, ErrorResponse>>()?;
+
+    let salt = parse_hex32(&req.salt, "salt")?;
+
+    let input_coin_ids: Vec<String> = inputs.iter().map(|i| hex::encode(i.coin_id())).collect();
+    let output_commit_hashes: Vec<String> = outputs.iter().map(|o| hex::encode(o.hash_for_commitment())).collect();
+    
+let fee = {
+        let in_sum = inputs.iter()
+            .try_fold(0u64, |acc, i| acc.checked_add(i.value))
+            .ok_or_else(|| ErrorResponse { error: "Input value overflow".into() })?;
+        let out_sum = outputs.iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value()))
+            .ok_or_else(|| ErrorResponse { error: "Output value overflow".into() })?;
+        in_sum.saturating_sub(out_sum)
+    };
+
+    let tx = if req.is_consolidate {
+        if witnesses.len() != 1 {
+            return Err(ErrorResponse { error: "Consolidate transactions must have exactly 1 signature".into() });
+        }
+        Transaction::Consolidate { inputs, witness: witnesses.into_iter().next().unwrap(), outputs, salt }
+    } else {
+        Transaction::Reveal { inputs, witnesses, outputs, salt }
+    };
+
+    node.send_transaction(tx)
+        .await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(SendTransactionResponse {
+        input_coins: input_coin_ids,
+        output_coins: output_commit_hashes,
+        fee,
+        status: "submitted".to_string(),
+    }))
+}
+
+pub async fn check_coin(
+    State(node): State<AppState>,
+    Json(req): Json<CheckCoinRequest>,
+) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
+    let coin = parse_hex32(&req.coin, "coin")?;
+    let exists = node.check_coin(coin).await;
+
+    Ok(Json(CheckCoinResponse {
+        exists,
+        coin: hex::encode(coin),
+    }))
+}
+
+pub async fn check_commitment(
+    State(node): State<AppState>,
+    Json(req): Json<CheckCommitmentRequest>,
+) -> Result<Json<CheckCommitmentResponse>, ErrorResponse> {
+    let commitment = parse_hex32(&req.commitment, "commitment")?;
+    let exists = node.check_commitment(commitment).await;
+
+    Ok(Json(CheckCommitmentResponse {
+        exists,
+        commitment: hex::encode(commitment),
+    }))
+}
+
+pub async fn get_mempool(State(node): State<AppState>) -> Json<GetMempoolResponse> {
+    let (size, transactions) = node.get_mempool_with_meta().await;
+    // Chain state is needed to evaluate each commit's PoW (the commit queue's
+    // actual priority key), which is bound to the current chain state.
+    let state = node.get_state().await;
+    // One reference clock for the whole response, so all ages are mutually
+    // consistent within a single poll.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    /// Cap on the hex payload preview for DataBurn outputs, so a maximal burn
+    /// can't bloat the polled /mempool response.
+    const BURN_PREVIEW_BYTES: usize = 64;
+
+    fn describe_io(
+        inputs: &[InputReveal],
+        outputs: &[OutputData],
+    ) -> (Vec<MempoolInputInfo>, Vec<MempoolOutputInfo>, u64, u64) {
+        let ins: Vec<MempoolInputInfo> = inputs.iter().map(|i| MempoolInputInfo {
+            coin_id: hex::encode(i.coin_id()),
+            value: i.value,
+            commitment: i.commitment.map(hex::encode),
+        }).collect();
+
+        let outs: Vec<MempoolOutputInfo> = outputs.iter().map(|o| match o {
+            OutputData::Standard { address, value, .. } => MempoolOutputInfo {
+                kind: "standard".into(),
+                address: Some(hex::encode(address)),
+                value: Some(*value),
+                coin_id: o.coin_id().map(hex::encode),
+                payload_preview: None,
+                payload_len: None,
+            },
+            OutputData::Confidential { address, .. } => MempoolOutputInfo {
+                kind: "confidential".into(),
+                address: Some(hex::encode(address)),
+                value: None, // hidden by design
+                coin_id: o.coin_id().map(hex::encode),
+                payload_preview: None,
+                payload_len: None,
+            },
+            OutputData::DataBurn { payload, value_burned } => MempoolOutputInfo {
+                kind: "data_burn".into(),
+                address: None,
+                value: Some(*value_burned),
+                coin_id: None,
+                payload_preview: Some(hex::encode(&payload[..payload.len().min(BURN_PREVIEW_BYTES)])),
+                payload_len: Some(payload.len()),
+            },
+        }).collect();
+
+        let total_in: u64 = inputs.iter().map(|i| i.value).sum();
+        let total_out: u64 = outputs.iter().map(|o| o.value()).sum();
+        (ins, outs, total_in, total_out)
+    }
+
+    let tx_info: Vec<_> = transactions
+        .iter()
+        .map(|(tx, received)| {
+            let age_secs = Some(now.saturating_sub(*received));
+            match tx {
+            Transaction::Commit { commitment, spam_nonce } => TransactionInfo {
+                commitment: Some(hex::encode(commitment)),
+                tx_type: Some("commit".into()),
+                age_secs,
+                // The commit queue is priority-sorted by achieved PoW; expose it
+                // so the explorer can show each commit against required_pow.
+                pow_zeros: crate::core::transaction::evaluate_commit_pow(commitment, *spam_nonce, &state).ok(),
+                ..Default::default()
+            },
+            Transaction::Reveal { inputs, outputs, .. }
+            | Transaction::Consolidate { inputs, outputs, .. } => {
+                let (ins, outs, total_in, total_out) = describe_io(inputs, outputs);
+                let fee = tx.fee();
+                let size_bytes = bincode::serialized_size(tx).unwrap_or(0);
+                let fee_per_kb = if size_bytes > 0 {
+                    ((fee as u128 * 1024) / size_bytes as u128) as u64
+                } else { 0 };
+                TransactionInfo {
+                    input_coins: Some(ins.iter().map(|i| i.coin_id.clone()).collect()),
+                    output_coins: Some(outs.iter().filter_map(|o| o.coin_id.clone()).collect()),
+                    fee: Some(fee),
+                    tx_type: Some(if matches!(tx, Transaction::Consolidate { .. }) {
+                        "consolidate".into()
+                    } else {
+                        "reveal".into()
+                    }),
+                    size_bytes: Some(size_bytes),
+                    fee_per_kb: Some(fee_per_kb),
+                    total_in: Some(total_in),
+                    total_out: Some(total_out),
+                    inputs: Some(ins),
+                    outputs: Some(outs),
+                    age_secs,
+                    ..Default::default()
+                }
+            }
+        }})
+        .collect();
+
+    Json(GetMempoolResponse { size, transactions: tx_info })
+}
+pub async fn scan_addresses(
+    State(node): State<AppState>,
+    // ConnectInfo/HeaderMap must precede Json: Json consumes the body and so
+    // must be the last extractor. Requires the router to be built with
+    // .into_make_service_with_connect_info::<SocketAddr>() — server.rs already is.
+    ConnectInfo(sock): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<ScanRequest>,
+) -> Result<Json<ScanResponse>, ErrorResponse> {
+    // Cap scan window to prevent disk I/O exhaustion on constrained hardware
+    const MAX_SCAN_RANGE: u64 = 10_000;
+    const MAX_SCAN_ADDRESSES: usize = 1_000;
+    let capped_end = req.start_height.saturating_add(MAX_SCAN_RANGE).min(req.end_height);
+
+    if req.addresses.len() > MAX_SCAN_ADDRESSES {
+        return Err(ErrorResponse {
+            error: format!("Too many addresses: {} (max {})", req.addresses.len(), MAX_SCAN_ADDRESSES),
+        });
+    }
+
+    // --- Server-authoritative PoW ---
+    //
+    // Required unconditionally, not just for "deeper" scans. The proof used to
+    // be optional, which meant omitting the field bought an ungated scan of up
+    // to MAX_SCAN_RANGE (10,000) blocks — twice /search's range, and /search IS
+    // gated. An optional gate is not a gate; it's a suggestion.
+    //
+    // Difficulty is whatever the governor says this IP owes right now; the
+    // client discovers it via /pow_params and does not get a vote.
+    if req.addresses.is_empty() {
+        return Err(ErrorResponse { error: "No addresses to scan".into() });
+    }
+    let pow = req.pow.as_ref().ok_or_else(|| ErrorResponse {
+        error: "Scan requires proof-of-work — see /pow_params".into(),
+    })?;
+    // Bind the proof to the SAME start_height the request carries: the preimage
+    // is "{addr}:{start_height}:{ts}:{nonce}" on both sides. Mining one value and
+    // submitting another was a real bug in the explorer.
+    //
+    // The proof binds addresses[0] only, so it is replayable across different
+    // address sets inside the 600s timestamp window — but each replay is charged
+    // by the governor, so after the free allowance the stale proof no longer
+    // meets the raised requirement and must be re-mined. The escalation bounds
+    // replay without needing a nonce ledger.
+    let subject = req.addresses[0].clone();
+    verify_pow(pow_client_ip(&sock, &headers), &subject, req.start_height, pow.timestamp, pow.nonce, &pow.hash)?;
+
+    let addresses: Vec<[u8; 32]> = req.addresses.iter()
+        .map(|h| parse_hex32(h, "address"))
+        .collect::<Result<_, _>>()?;
+
+    let coins = node.scan_addresses(&addresses, req.start_height, capped_end)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(ScanResponse {
+        coins: coins.into_iter().map(|c| ScanCoin {
+            address: hex::encode(c.address),
+            value: c.value,
+            salt: hex::encode(c.salt),
+            coin_id: hex::encode(c.coin_id),
+            height: c.height,
+        }).collect(),
+    }))
+}
+
+pub async fn generate_key() -> Json<GenerateKeyResponse> {
+    let seed: [u8; 32] = rand::random();
+    let owner_pk = wots::keygen(&seed);
+    let address = compute_address(&owner_pk);
+
+    Json(GenerateKeyResponse {
+        seed: hex::encode(seed),
+        address: hex::encode(address),
+    })
+}
+
+pub async fn get_peers(State(node): State<AppState>) -> Json<GetPeersResponse> {
+    let peers = node.get_peers().await;
+    Json(GetPeersResponse { peers })
+}
+
+pub async fn get_metrics(State(node): State<AppState>) -> Json<GetMetricsResponse> {
+    Json(GetMetricsResponse {
+        transactions_processed: node.metrics.transactions_processed(),
+        batches_processed:      node.metrics.batches_processed(),
+        batches_mined:          node.metrics.batches_mined(),
+        invalid_batches:        node.metrics.invalid_batches(),
+        invalid_transactions:   node.metrics.invalid_transactions(),
+        reorgs:                 node.metrics.reorgs(),
+    })
+}
+
+/// Retrieve historical block statistics for chain analytics.
+pub async fn get_chain_stats(
+    State(node): State<AppState>,
+) -> Result<Json<ChainStatsResponse>, ErrorResponse> {
+    let state = node.get_state().await;
+    let store = &node.storage.batches;
+    
+    // Fetch up to the last 144 blocks (approx 2.4 hours at 1m blocks)
+    let limit = 144;
+    let start = state.height.saturating_sub(limit);
+    let end = state.height;
+    
+    let batches = store.load_range(start, end)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+        
+    let mut blocks = Vec::with_capacity(batches.len());
+    // Reverse so the newest block is first
+    for (h, b) in batches.into_iter().rev() {
+        blocks.push(BlockStat {
+            height: h,
+            timestamp: b.timestamp,
+            target: hex::encode(b.target),
+            tx_count: b.transactions.len(),
+        });
+    }
+    
+    Ok(Json(ChainStatsResponse { blocks }))
+}
+
+// ── CoinJoin Mix Handlers ───────────────────────────────────────────────
+pub async fn mix_create(
+    State(node): State<AppState>,
+    Json(req): Json<MixCreateRequest>,
+) -> Result<Json<MixCreateResponse>, ErrorResponse> {
+    let mix_id = node.mix_create(req.denomination, req.min_participants).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(MixCreateResponse {
+        mix_id: hex::encode(mix_id),
+        denomination: req.denomination,
+        status: "collecting".to_string(),
+    }))
+}
+
+pub async fn mix_register(
+    State(node): State<AppState>,
+    Json(req): Json<MixRegisterRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+
+    let input = InputReveal {
+        predicate: Predicate::Script { 
+            bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+        },
+        value: req.input.value,
+        salt: parse_hex32(&req.input.salt, "input_salt")?,
+        commitment: req.input.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
+    };
+    
+    let output = match req.output {
+        OutputDataJson::Standard { address, value, salt } => OutputData::Standard {
+            address: parse_hex32(&address, "address")?,
+            value,
+            salt: parse_hex32(&salt, "output_salt")?,
+        },
+        OutputDataJson::Confidential { address, commitment, salt } => OutputData::Confidential {
+            address: parse_hex32(&address, "address")?,
+            commitment: parse_hex32(&commitment, "commitment")?,
+            salt: parse_hex32(&salt, "output_salt")?,
+        },
+        OutputDataJson::DataBurn { .. } => {
+            return Err(ErrorResponse { error: "DataBurn payloads are not allowed in CoinJoin mixes".into() })
+        }
+    };
+
+    // --- Validate coin exists in UTXO set before touching MixManager ---
+    let coin_id = input.coin_id();
+    {
+        let state = node.get_state().await;
+        if !state.coins.contains(&coin_id) {
+            return Err(ErrorResponse {
+                error: "Input coin does not exist or is already spent".into(),
+            });
+        }
+    }
+    // -------------------------------------------------------------------
+
+    // --- Decode the signature from the RPC request ---
+    let signature = hex::decode(&req.signature)
+        .map_err(|e| ErrorResponse { error: format!("Invalid signature hex: {}", e) })?;
+    // ------------------------------------------------------
+
+    // Pass the signature into the node handle
+    node.mix_register(mix_id, input, output, signature).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+        Ok(Json(serde_json::json!({ "status": "registered" })))
+}
+
+pub async fn mix_fee(
+    State(node): State<AppState>,
+    Json(req): Json<MixFeeRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+
+    let input = InputReveal {
+        predicate: Predicate::Script { 
+            bytecode: hex::decode(&req.input.bytecode).map_err(|e| ErrorResponse { error: format!("Invalid bytecode hex: {}", e) })? 
+        },
+        value: req.input.value,
+        salt: parse_hex32(&req.input.salt, "input_salt")?,
+        commitment: req.input.commitment.as_ref().map(|c| parse_hex32(c, "input_commitment")).transpose()?,
+    };
+    
+    // --- Validate fee coin exists in UTXO set before touching MixManager ---
+    {
+        let coin_id = input.coin_id();
+        let state = node.get_state().await;
+        if !state.coins.contains(&coin_id) {
+            return Err(ErrorResponse {
+                error: "Fee input coin does not exist or is already spent".into(),
+            });
+        }
+    }
+    // ---------------------------------------------------------------------
+
+    node.mix_set_fee(mix_id, input).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(serde_json::json!({ "status": "fee_set" })))
+}
+
+pub async fn mix_sign(
+    State(node): State<AppState>,
+    Json(req): Json<MixSignRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let mix_id = parse_hex32(&req.mix_id, "mix_id")?;
+    let coin_id = parse_hex32(&req.coin_id, "coin_id")?;
+
+    let input_index = node.mix_find_input_index(mix_id, coin_id).await
+        .ok_or_else(|| ErrorResponse {
+            error: format!("coin {} not found in mix proposal", req.coin_id),
+        })?;
+
+    let signature = hex::decode(&req.signature)
+        .map_err(|e| ErrorResponse { error: format!("invalid signature hex: {}", e) })?;
+
+    let height = node.get_state().await.height;
+    node.mix_sign(mix_id, input_index, signature, height).await
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    Ok(Json(serde_json::json!({ "status": "signed", "input_index": input_index })))
+}
+
+pub async fn mix_status(
+    State(node): State<AppState>,
+    axum::extract::Path(mix_id_hex): axum::extract::Path<String>,
+) -> Result<Json<MixStatusResponse>, ErrorResponse> {
+    let mix_id = parse_hex32(&mix_id_hex, "mix_id")?;
+
+    let snapshot = node.mix_status(mix_id).await
+        .ok_or_else(|| ErrorResponse { error: "mix session not found".to_string() })?;
+
+    Ok(Json(snapshot_to_response(snapshot)))
+}
+
+pub async fn mix_list(
+    State(node): State<AppState>,
+) -> Json<MixListResponse> {
+    let sessions = node.mix_list().await;
+    Json(MixListResponse {
+        sessions: sessions.into_iter().map(snapshot_to_response).collect(),
+    })
+}
+
+pub async fn get_filters(
+    State(node): State<AppState>,
+    Json(req): Json<GetFiltersRequest>,
+) -> Result<Json<GetFiltersResponse>, ErrorResponse> {
+    // Limit to 1000 filters per request to prevent abuse
+    let count = (req.end_height.saturating_sub(req.start_height)).min(1000);
+    let end = req.start_height + count;
+
+    let store = &node.storage.batches;
+
+    let mut filters = Vec::new();
+    let mut block_hashes = Vec::new();
+    let mut element_counts = Vec::new();
+
+    for h in req.start_height..end {
+        // 1. Load the block FIRST. If the block doesn't exist, we've reached the chain tip.
+        let batch = match store.load(h) {
+            Ok(Some(b)) => b,
+            _ => break, // It is safe to break here.
+        };
+
+        // 2. Load the filter. If it's missing (e.g., empty block), just use an empty array.
+        let filter_data = match store.load_filter(h) {
+            Ok(Some(data)) => data,
+            _ => Vec::new(), 
+        };
+
+        // Element count MUST come from the same code that built the filter.
+        // This used to be a hand-copied duplicate of CompactFilter::items_in().
+        // `n` is a hash-range parameter, not a statistic: match_any computes
+        // `modulus = n * FPR_INVERSE`, so if the count drifts from build()'s by
+        // even one, every client's query hashes into the wrong range and the
+        // filter returns confident garbage. Call the real thing.
+        let items = crate::core::filter::CompactFilter::items_in(&batch);
+
+        filters.push(hex::encode(filter_data));
+        block_hashes.push(hex::encode(batch.extension.final_hash));
+        element_counts.push(items.len() as u64);
+    }
+
+    Ok(Json(GetFiltersResponse {
+        start_height: req.start_height,
+        filters,
+        block_hashes,
+        element_counts,
+    }))
+}
+
+fn snapshot_to_response(s: crate::mix::MixStatusSnapshot) -> MixStatusResponse {
+    let phase_str = match &s.phase {
+        crate::mix::MixPhase::Collecting => "collecting",
+        crate::mix::MixPhase::Signing => "signing",
+        crate::mix::MixPhase::CommitSubmitted => "commit_submitted",
+        crate::mix::MixPhase::Complete => "complete",
+        crate::mix::MixPhase::Failed(_) => "failed",
+    };
+    MixStatusResponse {
+        mix_id: s.mix_id,
+        denomination: s.denomination,
+        participants: s.participants,
+        phase: phase_str.to_string(),
+        commitment: s.commitment,
+        input_coin_ids: s.input_coin_ids,
+    }
+}
+
+// ── Explorer Endpoints ──────────────────────────────────────────────────
+
+/// Return a batch with witnesses stripped (they're ~40KB each and useless
+/// for display). Keeps the explorer snappy.
+pub async fn get_batch(
+    State(node): State<AppState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let store = &node.storage.batches;
+
+    let batch = store.load(height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?
+        .ok_or_else(|| ErrorResponse { error: format!("Batch at height {} not found", height) })?;
+
+    // Serialize to JSON, then strip the witness arrays to save bandwidth
+    let mut val = serde_json::to_value(&batch)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    // Strip witnesses from each Reveal transaction
+    if let Some(txs) = val.get_mut("transactions").and_then(|v| v.as_array_mut()) {
+        for tx in txs {
+            if let Some(reveal) = tx.get_mut("Reveal") {
+                if let Some(witnesses) = reveal.get_mut("witnesses") {
+                    let count = witnesses.as_array().map(|a| a.len()).unwrap_or(0);
+                    *witnesses = serde_json::json!(format!("{} witness(es) stripped", count));
+                }
+            } else if let Some(consolidate) = tx.get_mut("Consolidate") {
+                if let Some(witness) = consolidate.get_mut("witness") {
+                    *witness = serde_json::json!("1 witness stripped");
+                }
+            }
+        }
+    }
+
+    // Inject height into the response
+    val.as_object_mut().map(|o| o.insert("height".to_string(), serde_json::json!(height)));
+
+    Ok(Json(val))
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Server-authoritative proof-of-work
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Difficulty is decided HERE, never by the caller. The explorer previously
+// escalated its own difficulty from a localStorage timestamp while the server
+// accepted any 4-zero proof — so an abuser paid the floor forever and only
+// honest users paid the tax.
+//
+// Protocol:
+//   1. client GET/POST /pow_params      -> { zeros, window_secs, ... }   (free)
+//   2. client mines blake3("{subject}:{height}:{ts}:{nonce}") to `zeros`
+//   3. client submits; the server re-derives the requirement and verifies
+//
+// Step 3 re-derives rather than trusting step 1, so a stale quote cannot buy a
+// discount. A client that gets outbid mid-mine is rejected, re-quotes and
+// retries — costing a round trip, never correctness.
+
+/// Process-wide governor. Kept as a lazy singleton rather than a NodeHandle
+/// field so this drops in without touching the node's construction path.
+fn pow_governor() -> &'static crate::rpc::pow_governor::PowGovernor {
+    static G: std::sync::OnceLock<crate::rpc::pow_governor::PowGovernor> = std::sync::OnceLock::new();
+    G.get_or_init(crate::rpc::pow_governor::PowGovernor::new)
+}
+
+/// The IP a PoW bucket is keyed on.
+///
+/// Deliberately the SOCKET address, not X-Forwarded-For. XFF is caller-supplied:
+/// honouring it by default would let anyone send a random header per request,
+/// land in a fresh bucket every time, and never escalate — defeating the whole
+/// mechanism. Behind a trusted reverse proxy every client shares the proxy's
+/// bucket, which is wrong in the SAFE direction (too strict, never too lax).
+///
+/// If you terminate at a proxy and want per-client accounting, set
+/// mirstat_TRUST_XFF=1 **and** make the proxy OVERWRITE the header, e.g. nginx:
+///     proxy_set_header X-Forwarded-For $remote_addr;      # not $proxy_add_...
+/// Appending instead of overwriting re-opens the spoof.
+fn pow_client_ip(addr: &std::net::SocketAddr, headers: &axum::http::HeaderMap) -> std::net::IpAddr {
+    if std::env::var("mirstat_TRUST_XFF").as_deref() == Ok("1") {
+        if let Some(fwd) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+        {
+            if let Ok(ip) = fwd.parse::<std::net::IpAddr>() {
+                return ip;
+            }
+        }
+    }
+    addr.ip()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Verify a submitted proof against the difficulty this IP currently owes.
+///
+/// `subject` is the address (for /scan) or the query (for /search); `height` is
+/// the request's start_height, or 0 where there is none. Both sides MUST agree
+/// on this preimage — mining one string and submitting another was a real bug.
+///
+/// Takes the proof's fields rather than the struct, so this compiles regardless
+/// of what your request type calls it and needs no import to stay in sync.
+///
+/// On success the request is charged. Failures are not charged: verification is
+/// a single BLAKE3 of ~90 bytes, so counting them would let an attacker inflate
+/// a shared NAT's price for free.
+fn verify_pow(
+    ip: std::net::IpAddr,
+    subject: &str,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+    claimed_hash: &str,
+) -> Result<(), ErrorResponse> {
+    use crate::rpc::pow_governor::leading_hex_zeros;
+
+    let now = unix_now();
+    if timestamp < now.saturating_sub(600) || timestamp > now + 120 {
+        return Err(ErrorResponse { error: "PoW timestamp is too old or in the future".into() });
+    }
+
+    let input = format!("{}:{}:{}:{}", subject, height, timestamp, nonce);
+    let computed_hex = hex::encode(blake3::hash(input.as_bytes()).as_bytes());
+    if computed_hex != claimed_hash {
+        return Err(ErrorResponse { error: "Invalid PoW hash".into() });
+    }
+
+    let required = pow_governor().required_zeros(ip, now);
+    let got = leading_hex_zeros(&computed_hex);
+    if got < required {
+        // State the requirement so the client can re-mine without guessing.
+        return Err(ErrorResponse {
+            error: format!(
+                "PoW difficulty too low: {} leading zeros required, got {}. Re-check /pow_params.",
+                required, got
+            ),
+        });
+    }
+
+    pow_governor().record(ip, now);
+    Ok(())
+}
+
+/// What this caller must pay for its next expensive request. Free by design:
+/// a client cannot discover the price without asking.
+pub async fn pow_params(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Json<PowParamsResponse> {
+    let now = unix_now();
+    let ip = pow_client_ip(&addr, &headers);
+    pow_governor().prune(now);
+    Json(PowParamsResponse {
+        zeros: pow_governor().required_zeros(ip, now),
+        min_zeros: crate::rpc::pow_governor::MIN_ZEROS,
+        max_zeros: crate::rpc::pow_governor::MAX_ZEROS,
+        window_secs: crate::rpc::pow_governor::WINDOW_SECS,
+        server_time: now,
+    })
+}
+
+/// Universal search: find any 32-byte hash across blocks, txs, addresses.
+/// Searches the last `limit` blocks (default 1000) server-side.
+pub async fn search(
+    State(node): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, ErrorResponse> {
+    let query = crate::core::types::parse_address_flexible(&req.query)
+        .map_err(|e| ErrorResponse { error: e })?;
+
+    // This endpoint loads and linearly scans up to 5000 batches per call — more
+    // disk I/O than /scan, which was already gated while this was wide open.
+    // Height is pinned to 0: search has no start_height, and reusing the same
+    // preimage shape lets the client keep one miner.
+    let pow = req.pow.as_ref().ok_or_else(|| ErrorResponse {
+        error: "Search requires proof-of-work — see /pow_params".into(),
+    })?;
+    verify_pow(pow_client_ip(&addr, &headers), &req.query, 0, pow.timestamp, pow.nonce, &pow.hash)?;
+
+    let store = &node.storage.batches; 
+
+    let tip = store.highest()
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+
+    // Compact filters give us one cheap win here and only one: an EMPTY filter
+    // means an empty block, so we skip the batch load entirely.
+    //
+    // They cannot do more, despite the temptation. This search also matches
+    // block_hash, prev_mirstat, state_root and reveal_salt, and CompactFilter
+    // covers none of those (see filter::items_in — commitments, coin_ids and
+    // addresses only). So a filter MISS cannot skip a block without silently
+    // losing those result types. And match_any() needs the element count `n`,
+    // which is derived from the batch — so consulting the filter would force the
+    // very load it was meant to avoid, then charge a siphash per block for the
+    // privilege.
+    //
+    // Making the filter genuinely useful here needs a storage change: persist
+    // (block_hash, n) alongside each filter so a miss can skip the load, and
+    // index the block-level hashes separately. Until then the honest protection
+    // for this endpoint is the PoW gate below, not the filter.
+    let search_start = tip.saturating_sub(5000);
+    let mut results = Vec::new();
+
+    // Which heights are worth loading?
+    //
+    // Two sources, because the compact filter covers only part of what we match:
+    //
+    //   1. SEARCH_INDEX: block_hash / prev_mirstat / state_root / reveal salt.
+    //      O(1), and over ALL history — not just the 5000-block window, so a
+    //      block hash from a year ago now resolves instantly instead of not at
+    //      all.
+    //   2. The window, filtered: commitments / coin_ids / addresses live in the
+    //      compact filter. With (block_hash, n) now persisted beside each filter,
+    //      match_any runs WITHOUT loading the batch — so we only pay for real
+    //      hits plus the filter's false positives (~1/784), instead of
+    //      deserialising every non-empty block in the window.
+    //
+    // A height missing from the index or the meta table means "not yet
+    // backfilled", which must degrade to loading the batch. Treating absence as
+    // "no match" would make search silently lie during the first-run backfill.
+    let mut candidates: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+
+    for h in crate::storage::search_index::lookup(&node.storage.db(), &query).unwrap_or_default() {
+        candidates.insert(h);
+    }
+
+    // Two range scans, not ten thousand point lookups. Both load_filter() and
+    // filter_meta() open a fresh read transaction per call (~17 µs of pure
+    // overhead each), which across a 5000-block window costs more than the work.
+    // Search always walks a contiguous range, so scan it as one.
+    let filters = store.load_filter_range(search_start, tip).unwrap_or_default();
+    let metas = crate::storage::search_index::filter_meta_range(&node.storage.db(), search_start, tip)
+        .unwrap_or_default();
+
+    for height in search_start..=tip {
+        let filter_data = match filters.get(&height) {
+            Some(d) if !d.is_empty() => d,
+            Some(_) => continue,                   // empty filter -> empty block
+            None => { candidates.insert(height); continue; }   // no filter -> can't rule it out
+        };
+        match metas.get(&height) {
+            Some((block_hash, n)) => {
+                if crate::core::filter::match_any(filter_data, block_hash, *n, &[query]) {
+                    candidates.insert(height);
+                }
+            }
+            // Unindexed height: fall back to loading the batch. Slow but correct —
+            // absence must never be read as "no match".
+            None => { candidates.insert(height); }
+        }
+    }
+
+    for height in candidates.into_iter().rev() {
+        let batch = match store.load(height) {
+            Ok(Some(b)) => b,
+            _ => continue,
+        };
+
+        // Check block-level hashes
+        if batch.extension.final_hash == query {
+            results.push(SearchResult {
+                result_type: "block_hash".into(),
+                height,
+                tx_index: None,
+                detail: "Block hash match".into(),
+            });
+        }
+        if batch.prev_mirstat == query {
+            results.push(SearchResult {
+                result_type: "prev_mirstat".into(),
+                height,
+                tx_index: None,
+                detail: "Parent mirstat match".into(),
+            });
+        }
+        if batch.state_root == query {
+            results.push(SearchResult {
+                result_type: "state_root".into(),
+                height,
+                tx_index: None,
+                detail: "State root match".into(),
+            });
+        }
+
+        // Check coinbase
+        for cb in &batch.coinbase {
+            if cb.address == query {
+                results.push(SearchResult {
+                    result_type: "coinbase_address".into(),
+                    height,
+                    tx_index: None,
+                    detail: format!("Coinbase output, value {}", cb.value),
+                });
+            }
+            if cb.coin_id() == query {
+                results.push(SearchResult {
+                    result_type: "coinbase_coin_id".into(),
+                    height,
+                    tx_index: None,
+                    detail: format!("Coinbase coin, value {}", cb.value),
+                });
+            }
+        }
+
+        // Check transactions
+        for (i, tx) in batch.transactions.iter().enumerate() {
+            match tx {
+                Transaction::Commit { commitment, .. } => {
+                    if *commitment == query {
+                        results.push(SearchResult {
+                            result_type: "commitment".into(),
+                            height,
+                            tx_index: Some(i),
+                            detail: "Commitment hash match".into(),
+                        });
+                    }
+                }
+               Transaction::Reveal { inputs, outputs, salt, .. } | Transaction::Consolidate { inputs, outputs, salt, .. } => {
+                    if *salt == query {
+                        results.push(SearchResult {
+                            result_type: "reveal_salt".into(),
+                            height,
+                            tx_index: Some(i),
+                            detail: "Reveal commitment salt".into(),
+                        });
+                    }
+                    for (j, inp) in inputs.iter().enumerate() {
+                        if inp.predicate.address() == query {
+                            results.push(SearchResult {
+                                result_type: "input_address".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Input {} spent, value {}", j, inp.value),
+                            });
+                        }
+                        if inp.coin_id() == query {
+                            results.push(SearchResult {
+                                result_type: "input_coin_id".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Input {} coin spent, value {}", j, inp.value),
+                            });
+                        }
+                    }
+                    for (j, out) in outputs.iter().enumerate() {
+                        if out.address() == query {
+                            results.push(SearchResult {
+                                result_type: "output_address".into(),
+                                height,
+                                tx_index: Some(i),
+                                detail: format!("Output {} created, value {}", j, out.value()),
+                            });
+                        }
+                        if let Some(cid) = out.coin_id() {
+                            if cid == query {
+                                results.push(SearchResult {
+                                    result_type: "output_coin_id".into(),
+                                    height,
+                                    tx_index: Some(i),
+                                    detail: format!("Output {} coin created, value {}", j, out.value()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Stop after finding results (return all matches at first matching height,
+        // then keep scanning for more)
+        if results.len() >= 50 {
+            break;
+        }
+    }
+
+    Ok(Json(SearchResponse { results }))
+}
+
+/// Check whether a coin exists in the current UTXO set (GET version for explorer)
+pub async fn check_coin_get(
+    State(node): State<AppState>,
+    axum::extract::Path(coin_hex): axum::extract::Path<String>,
+) -> Result<Json<CheckCoinResponse>, ErrorResponse> {
+    let coin = parse_hex32(&coin_hex, "coin")?;
+    let exists = node.check_coin(coin).await;
+    Ok(Json(CheckCoinResponse {
+        exists,
+        coin: hex::encode(coin),
+    }))
+}
+
+pub async fn check_output(
+    State(node): State<AppState>,
+    Json(req): Json<CheckOutputRequest>,
+) -> Result<Json<CheckOutputResponse>, ErrorResponse> {
+    let address = parse_hex32(&req.address, "address")?;
+    let salt    = parse_hex32(&req.salt,    "salt")?;
+    let coin_id = compute_coin_id(&address, req.value, &salt);
+    let exists  = node.check_coin(coin_id).await;
+    Ok(Json(CheckOutputResponse {
+        coin_id: hex::encode(coin_id),
+        exists,
+    }))
+}
+
+/// Return a raw block for private wallet scanning.
+/// Unlike /batch/:height, this returns the full Batch struct including
+/// output addresses and salts but with witnesses stripped for bandwidth.
+/// The wallet parses this client-side so it never has to send addresses
+/// to the node — preserving Neutrino-level scan privacy.
+pub async fn get_block_raw(
+    State(node): State<AppState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<Json<crate::core::Batch>, ErrorResponse> {
+    let store = &node.storage.batches; 
+
+    let mut batch = store.load(height)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?
+        .ok_or_else(|| ErrorResponse { error: format!("Block at height {} not found", height) })?;
+
+    // Strip witness data to save bandwidth (~40KB per input).
+    // The wallet only needs inputs (for address) and outputs (for address, value, salt).
+    for tx in &mut batch.transactions {
+        if let Transaction::Reveal { witnesses, .. } = tx {
+            *witnesses = vec![];
+        }
+    }
+
+    Ok(Json(batch))
+}
+
+pub async fn explorer_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("explorer.html"))
+}
+
+// --- NEW: mirstatAxe Handlers ---
+
+pub async fn axe_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("miner_dashboard.html"))
+}
+
+pub async fn axe_stats(State(node): State<AppState>) -> Json<AxeStatsResponse> {
+    // Read Pi CPU Temperature
+    let temp_c = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .map(|milli_celsius| milli_celsius / 1000.0)
+        .unwrap_or(0.0);
+
+    // Read System Uptime
+    let uptime_s = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(|u| u.to_string()))
+        .and_then(|s| s.parse::<f32>().ok())
+        .map(|secs| secs as u64)
+        .unwrap_or(0);
+
+    // Read REAL hardware hashrate counter
+    let total_nonces = node.hash_counter.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Live CPU frequency (kHz -> MHz) so the dashboard reflects the actual
+    // clock (thermal throttling included) rather than a hardcoded value.
+    let freq_mhz = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|khz| (khz / 1000) as u32);
+
+    Json(AxeStatsResponse { 
+        temp_c, 
+        uptime_s, 
+        total_nonces,
+        is_axe_hardware: is_axe_device(), 
+        freq_mhz,
+    })
+}
+
+pub fn is_axe_device() -> bool {
+    // Look for the standard Raspberry Pi device tree string, 
+    // or allow a manual override file for custom Buildroot images.
+    std::fs::read_to_string("/sys/firmware/devicetree/base/model")
+        .map(|s| s.to_lowercase().contains("raspberry pi"))
+        .unwrap_or(false) || std::path::Path::new("/etc/mirstat_axe").exists()
+}
+
+pub async fn axe_wifi_setup(
+    Json(req): Json<AxeWifiRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    // --- HARDWARE SECURITY GATE ---
+    if !is_axe_device() {
+        tracing::warn!("Wi-Fi setup blocked: Not running on mirstatAxe hardware.");
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Hardware configuration is only permitted on mirstatAxe devices." 
+        })));
+    }
+    // ------------------------------
+
+    // PREVENT INJECTION: Reject quotes, newlines, backslashes, and enforce WPA2 spec limits
+    if req.ssid.len() > 32 || req.password.len() > 63 {
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "SSID must be ≤32 bytes, password ≤63 characters" 
+        })));
+    }
+    if req.ssid.contains('"') || req.ssid.contains('\n') || req.ssid.contains('\r') || req.ssid.contains('\\') ||
+       req.password.contains('"') || req.password.contains('\n') || req.password.contains('\r') || req.password.contains('\\') {
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Invalid characters in SSID or Password" 
+        })));
+    }
+
+    tracing::info!("Received WiFi setup request for SSID: {}", req.ssid);
+    
+    let conf = format!(
+        "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\nupdate_config=1\ncountry=AU\n\nnetwork={{\n    ssid=\"{}\"\n    psk=\"{}\"\n}}\n", 
+        req.ssid, req.password
+    );
+    
+    // 2. Write directly to the Linux filesystem
+    let config_path = "/etc/wpa_supplicant/wpa_supplicant.conf";
+    if let Err(e) = std::fs::write(config_path, &conf) {
+        tracing::error!("CRITICAL: Failed to write wpa_supplicant.conf: {}", e);
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": format!("Filesystem write error: {}", e) 
+        })));
+    }
+    tracing::debug!("Successfully wrote new WiFi credentials to {}", config_path);
+
+    // 3. Execute the shell command to reconfigure the wlan0 interface live
+    tracing::info!("Reloading wlan0 interface via wpa_cli...");
+    let output = std::process::Command::new("wpa_cli")
+        .args(&["-i", "wlan0", "reconfigure"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            tracing::info!("WiFi reconfigured successfully. Device should connect momentarily.");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::warn!("wpa_cli returned non-zero status. Stderr: {}", stderr);
+        }
+        Err(e) => {
+            tracing::error!("Failed to execute wpa_cli: {}. (Are you running on the Pi?)", e);
+        }
+    }
+
+    Ok(Json(serde_json::json!({ 
+        "status": "wifi_configured", 
+        "message": "Configuration saved. Networking service is reloading..." 
+    })))
+}
+
+pub async fn axe_save_config(
+    Json(req): Json<AxeConfigRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    tracing::info!("Received Axe Config Update: Mode={}", req.mode);
+    
+    // Create struct to safely serialize via the toml crate to prevent injection
+    let config = crate::node::MinerToml {
+        mining: crate::node::MiningConfig {
+            mode: req.mode.clone(),
+            pool_url: req.pool_url.clone(),
+            payout_address: req.payout_address.clone(),
+            pool_address: req.pool_address.clone(), // <-- NEW
+            // Optional rig name for per-worker pool stats; blank means "default".
+            worker: req.worker.clone().filter(|w| !w.trim().is_empty()),
+        }
+    };
+
+    let toml_content = toml::to_string(&config).map_err(|e| ErrorResponse {
+        error: format!("Failed to serialize config: {}", e)
+    })?;
+
+    // Write the securely formatted configuration to disk
+    let config_path = "miner.toml";
+    if let Err(e) = std::fs::write(config_path, &toml_content) {
+        tracing::error!("CRITICAL: Failed to write miner.toml: {}", e);
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": format!("Failed to save mining configuration: {}", e) 
+        })));
+    }
+
+    tracing::info!("Successfully wrote mining config to disk:\n{}", toml_content);
+
+    Ok(Json(serde_json::json!({ 
+        "status": "config_saved", 
+        "message": "Mining configuration written to miner.toml successfully." 
+    })))
+}
+
+/// GET /axe/config — read the *active* configuration back so the dashboard
+/// can pre-fill its forms with reality instead of hardcoded defaults.
+///
+/// Sources: `miner.toml` (the same file `axe_save_config` writes) for the
+/// mining mode, and the Pi boot config for the persisted overclock. All
+/// fields are best-effort `null` on a fresh device. Read-only, so no
+/// hardware gate is needed (the /axe scope is already LAN-only).
+pub async fn axe_get_config() -> Json<serde_json::Value> {
+    let mining = std::fs::read_to_string("miner.toml")
+        .ok()
+        .and_then(|s| toml::from_str::<crate::node::MinerToml>(&s).ok())
+        .map(|c| c.mining);
+
+    // Parse the persisted overclock back out of the boot config.
+    let mut configured_freq_mhz: Option<u32> = None;
+    let mut configured_overvoltage: Option<u32> = None;
+    for path in ["/boot/firmware/config.txt", "/boot/config.txt"] {
+        if let Ok(cfg) = std::fs::read_to_string(path) {
+            for line in cfg.lines() {
+                if let Some(v) = line.strip_prefix("arm_freq=") {
+                    configured_freq_mhz = v.trim().parse().ok();
+                }
+                if let Some(v) = line.strip_prefix("over_voltage=") {
+                    configured_overvoltage = v.trim().parse().ok();
+                }
+            }
+            break;
+        }
+    }
+
+    Json(serde_json::json!({
+        "mode": mining.as_ref().map(|m| m.mode.clone()).unwrap_or_else(|| "solo".to_string()),
+        "pool_url": mining.as_ref().and_then(|m| m.pool_url.clone()),
+        "payout_address": mining.as_ref().and_then(|m| m.payout_address.clone()),
+        "pool_address": mining.as_ref().and_then(|m| m.pool_address.clone()),
+        "worker": mining.as_ref().and_then(|m| m.worker.clone()),
+        "configured_freq_mhz": configured_freq_mhz,
+        "configured_overvoltage": configured_overvoltage,
+    }))
+}
+
+pub async fn axe_apply_overclock(
+    Json(req): Json<AxeOverclockRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    // --- HARDWARE SECURITY GATE ---
+    if !is_axe_device() {
+        tracing::warn!("Overclock blocked: Not running on mirstatAxe hardware.");
+        return Ok(Json(serde_json::json!({ 
+            "status": "error", 
+            "message": "Hardware configuration is only permitted on mirstatAxe devices." 
+        })));
+    }
+
+    // --- STRICT BOUNDS CHECKING ---
+    // Prevent the user from entering values that will prevent the Pi from booting
+    if req.freq < 800 || req.freq > 1400 {
+        return Err(ErrorResponse { error: "Frequency out of safe bounds (800-1400 MHz)".into() });
+    }
+    if req.overvoltage > 8 {
+        return Err(ErrorResponse { error: "Overvoltage out of safe bounds (0-8)".into() });
+    }
+
+    tracing::info!("Applying hardware overclock: {} MHz, OV: {}", req.freq, req.overvoltage);
+
+    // Buildroot uses /boot/config.txt, newer RaspiOS uses /boot/firmware/config.txt
+    let config_paths = ["/boot/firmware/config.txt", "/boot/config.txt"];
+    let mut target_path = "";
+    
+    for path in &config_paths {
+        if std::path::Path::new(path).exists() {
+            target_path = path;
+            break;
+        }
+    }
+
+    if target_path.is_empty() {
+        return Err(ErrorResponse { error: "Could not locate Raspberry Pi boot config".into() });
+    }
+
+    // Read current config
+    let current_config = std::fs::read_to_string(target_path)
+        .map_err(|e| ErrorResponse { error: format!("Failed to read config: {}", e) })?;
+
+    // Filter out old overclock settings
+    let mut new_config: Vec<String> = current_config.lines()
+        .filter(|line| {
+            !line.starts_with("arm_freq=") &&
+            !line.starts_with("over_voltage=") &&
+            !line.starts_with("force_turbo=")
+        })
+        .map(|s| s.to_string())
+        .collect();
+
+    // Append new requested settings
+    new_config.push(format!("arm_freq={}", req.freq));
+    new_config.push(format!("over_voltage={}", req.overvoltage));
+    new_config.push("force_turbo=1".to_string());
+
+    let config_content = new_config.join("\n") + "\n";
+
+    // Write back to disk
+    if let Err(e) = std::fs::write(target_path, config_content) {
+        tracing::error!("CRITICAL: Failed to write to {}: {}", target_path, e);
+        return Err(ErrorResponse { error: format!("File write error (requires root): {}", e) });
+    }
+
+    // Spawn a delayed reboot so we can return the HTTP response first
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tracing::warn!("Rebooting system to apply hardware overclock...");
+        let _ = std::process::Command::new("reboot").output();
+    });
+
+    Ok(Json(serde_json::json!({ 
+        "status": "success", 
+        "message": "Overclock applied to boot config. System rebooting..." 
+    })))
+}
+
+pub async fn axe_download_rewards(
+    State(_node): State<AppState>,
+) -> Result<Response, ErrorResponse> {
+    // --- HARDWARE + AUTH GATE ---
+    if !is_axe_device() {
+        return Err(ErrorResponse {
+            error: "Rewards download is only available on mirstatAxe hardware.".into(),
+        });
+    }
+
+    let log_path = "data/coinbase_seeds.jsonl";
+
+    let contents = std::fs::read_to_string(&log_path).unwrap_or_else(|_| {
+        tracing::warn!("No coinbase_seeds.jsonl found (no blocks mined yet?)");
+        String::new()
+    });
+
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/jsonl")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"coinbase_seeds.jsonl\"",
+        )
+        .body(axum::body::Body::from(contents))
+        .map_err(|e| ErrorResponse {
+            error: format!("Failed to build response: {}", e),
+        })?;
+
+    Ok(response)
+}
+
+pub async fn submit_batch(
+    State(node): State<AppState>,
+    Json(batch): Json<crate::core::Batch>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    
+    if node.tx_sender.try_send(crate::node::NodeCommand::SubmitMinedBlock(batch, Some(ack_tx))).is_err() {
+        return Err(ErrorResponse { error: "Node is currently overloaded".into() });
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(Ok(()))) => Ok(Json(serde_json::json!({ "accepted": true }))),
+        Ok(Ok(Err(e))) => Err(ErrorResponse { error: format!("Block rejected: {}", e) }),
+        Ok(Err(_))     => Err(ErrorResponse { error: "Node dropped submission ack".into() }),
+        Err(_)         => Err(ErrorResponse { error: "Block validation timed out".into() }),
+    }
+}
+
+pub async fn get_tx_by_input(
+    State(node): State<AppState>,
+    Json(req): Json<GetTxByInputRequest>,
+) -> Result<Json<Transaction>, ErrorResponse> {
+    let target_coin = parse_hex32(&req.coin_id, "coin_id")?;
+
+    // 1. Check Mempool (Fast Path - O(N) over a small array)
+    let (_, txs) = node.get_mempool_info().await;
+    for tx in txs {
+        if let Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } = &tx {
+            if inputs.iter().any(|i| i.coin_id() == target_coin) {
+                // Return the raw, unstripped transaction containing the witnesses
+                return Ok(Json(tx));
+            }
+        }
+    }
+
+    // 2. Check Chain History 
+    let store = &node.storage.batches; 
+    
+    let current_height = node.get_state().await.height;
+    let start = current_height.saturating_sub(100);
+
+    for h in (start..current_height).rev() {
+        if let Ok(Some(batch)) = store.load(h) {
+            for tx in batch.transactions {
+                if let Transaction::Reveal { inputs, .. } | Transaction::Consolidate { inputs, .. } = &tx {
+                    if inputs.iter().any(|i| i.coin_id() == target_coin) {
+                        // Return the raw, unstripped transaction containing the witnesses
+                        return Ok(Json(tx));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ErrorResponse { error: "Transaction spending this coin not found".into() })
+}
+
+
+/// Parse a reveal JSON payload into a Transaction::Reveal.
+/// Used by both the /send RPC handler and the light protocol handler.
+pub fn parse_reveal_json(value: serde_json::Value) -> Result<Transaction, String> {
+    let req: SendTransactionRequest = serde_json::from_value(value)
+        .map_err(|e| format!("Invalid reveal JSON: {}", e))?;
+
+    if req.inputs.is_empty() {
+        return Err("Must provide at least one input".into());
+    }
+    // Consolidate transactions carry exactly ONE aggregated witness covering ALL
+    // inputs (enforced below when the Transaction is built). The per-input count
+    // rule only applies to standard Reveals. This mirrors the identical exemption
+    // in `send_transaction`; without it here, any consolidate with >1 input is
+    // rejected on the light-protocol path before the consolidate branch is reached,
+    // making the two checks mutually unsatisfiable.
+    if !req.is_consolidate && req.signatures.len() != req.inputs.len() {
+        return Err("Signature count must match input count".into());
+    }
+
+    let inputs: Vec<InputReveal> = req.inputs.iter().map(|i| {
+        Ok(InputReveal {
+            predicate: Predicate::Script {
+                bytecode: hex::decode(&i.bytecode).map_err(|e| format!("Invalid bytecode hex: {}", e))?
+            },
+            value: i.value,
+            salt: {
+                let b = hex::decode(&i.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                <[u8; 32]>::try_from(b).map_err(|_| "salt must be 32 bytes".to_string())?
+            },
+            commitment: i.commitment.as_ref().map(|c| {
+                let b = hex::decode(c).map_err(|e| format!("Invalid commitment hex: {}", e))?;
+                <[u8; 32]>::try_from(b).map_err(|_| "commitment must be 32 bytes".to_string())
+            }).transpose()?,
+        })
+    }).collect::<Result<_, String>>()?;
+
+    let mut witnesses = Vec::new();
+    for sig_string in &req.signatures {
+        let stack_items = sig_string.split(',')
+            .filter(|s| !s.is_empty())
+            .map(hex::decode)
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .map_err(|e| format!("Invalid hex in witness stack: {}", e))?;
+        witnesses.push(Witness::ScriptInputs(stack_items));
+    }
+
+    let outputs: Vec<OutputData> = req.outputs.iter().map(|o| {
+        match o {
+            OutputDataJson::Standard { address, value, salt } => {
+                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
+                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                Ok(OutputData::Standard {
+                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
+                    value: *value,
+                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
+                })
+            }
+            OutputDataJson::Confidential { address, commitment, salt } => {
+                let a = hex::decode(address).map_err(|e| format!("Invalid address hex: {}", e))?;
+                let c = hex::decode(commitment).map_err(|e| format!("Invalid commitment hex: {}", e))?;
+                let s = hex::decode(salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+                Ok(OutputData::Confidential {
+                    address: <[u8; 32]>::try_from(a).map_err(|_| "address must be 32 bytes")?,
+                    commitment: <[u8; 32]>::try_from(c).map_err(|_| "commitment must be 32 bytes")?,
+                    salt: <[u8; 32]>::try_from(s).map_err(|_| "salt must be 32 bytes")?,
+                })
+            }
+            OutputDataJson::DataBurn { payload, value_burned } => {
+                Ok(OutputData::DataBurn {
+                    payload: hex::decode(payload).map_err(|_| "Invalid payload hex")?,
+                    value_burned: *value_burned,
+                })
+            }
+        }
+    }).collect::<Result<_, String>>()?;
+
+    let salt_bytes = hex::decode(&req.salt).map_err(|e| format!("Invalid salt hex: {}", e))?;
+    let salt = <[u8; 32]>::try_from(salt_bytes).map_err(|_| "salt must be 32 bytes".to_string())?;
+
+    if req.is_consolidate {
+        if witnesses.len() != 1 {
+            return Err("Consolidate transactions must have exactly 1 signature".into());
+        }
+        Ok(Transaction::Consolidate { inputs, witness: witnesses.into_iter().next().unwrap(), outputs, salt })
+    } else {
+        Ok(Transaction::Reveal { inputs, witnesses, outputs, salt })
+    }
+}
+
+pub async fn block_template(
+    State(node): State<AppState>,
+    Json(req): Json<crate::rpc::types::BlockTemplateRequest>,
+) -> Result<Json<crate::rpc::types::BlockTemplateResponse>, ErrorResponse> {
+    let state = node.get_state().await;
+    let (_, txs) = node.get_mempool_info().await;
+    
+    match crate::node::build_block_template_inner(&state, txs, &req) {
+        Ok(resp) => Ok(Json(resp)),
+        Err(crate::node::BlockTemplateError::InvalidCoinbase(msg)) => {
+            Err(ErrorResponse { error: msg.into() })
+        }
+        Err(crate::node::BlockTemplateError::CoinbaseTotalMismatch { expected_total, .. }) => {
+            Err(ErrorResponse { error: format!("Coinbase mismatch. Expected: {}", expected_total) })
+        }
+    }
+}
+
+pub async fn submit_chat(
+    State(node): State<AppState>,
+    Json(req): Json<SubmitChatRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    
+    if req.words.is_empty() && req.attachments.is_empty() {
+        return Err(ErrorResponse { error: "Message must contain words or attachments".into() });
+    }
+    if req.words.len() > 10 {
+        return Err(ErrorResponse { error: "Message must contain at most 10 words".into() });
+    }
+    if req.words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+        return Err(ErrorResponse { error: "Invalid word index".into() });
+    }
+    if req.attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+        return Err(ErrorResponse { error: "Too many attachments (max 4)".into() });
+    }
+    
+    // Verify the client's PoW locally
+    if !crate::node::verify_chat_pow_v2(&req.sender, req.timestamp, req.reply_to, &req.words, &req.attachments, req.nonce) {
+        return Err(ErrorResponse { error: "Invalid Chat PoW".into() });
+    }
+
+    // Since the client did the PoW, we can directly dispatch it
+    node.broadcast_premined_chat(
+        req.sender,
+        req.timestamp,
+        req.nonce,
+        req.reply_to,
+        req.words,
+        req.attachments,
+    ).map_err(|e| ErrorResponse { error: e.to_string() })?;
+    
+    Ok(Json(serde_json::json!({ "status": "broadcasted" })))
+}
+pub async fn get_chat(State(node): State<AppState>) -> Json<GetChatResponse> {
+    let hist = node.chat_history.read().await;
+    Json(GetChatResponse {
+        messages: hist.iter().cloned().collect(),
+        dictionary: crate::node::CHAT_DICTIONARY.iter().map(|&s| s.to_string()).collect(),
+    })
+}
+
+pub async fn send_chat(
+    State(node): State<AppState>,
+    headers: axum::http::HeaderMap, //  read Nginx headers
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<SendChatRequest>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    
+    // --- 1. PROXY-AWARE LAN FIREWALL CHECK ---
+    let check_is_lan = |ip: std::net::IpAddr| -> bool {
+        match ip {
+            std::net::IpAddr::V4(ipv4) => ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local(),
+            std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || (ipv6.segments()[0] & 0xfe00) == 0xfc00 || (ipv6.segments()[0] & 0xffc0) == 0xfe80,
+        }
+    };
+
+    // First check the immediate connection (Is it directly from the internet?)
+    let immediate_ip = addr.ip();
+    if !check_is_lan(immediate_ip) {
+        tracing::warn!("Blocked direct WAN access to chat POST from {}", immediate_ip);
+        return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+    }
+
+    // Immediate connection is local (e.g., Nginx or you on localhost).
+    // Now check if Nginx is telling us it's proxying someone from the public internet.
+    //
+    // X-Forwarded-For is a comma-separated chain. Under the standard
+    // `$proxy_add_x_forwarded_for` config, Nginx APPENDS the immediate client
+    // to whatever the client sent — so an attacker can prepend "127.0.0.1"
+    // to spoof a LAN origin. We require EVERY IP in the chain to be LAN;
+    // a single public IP anywhere in the chain proves the request crossed
+    // the WAN at some hop and must be rejected.
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
+        for ip_str in forwarded.split(',') {
+            match ip_str.trim().parse::<std::net::IpAddr>() {
+                Ok(ip) if !check_is_lan(ip) => {
+                    tracing::warn!("Blocked Nginx-proxied WAN access to chat POST: XFF chain contains {}", ip);
+                    return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+                }
+                Ok(_) => {} // LAN IP, keep checking the rest
+                Err(_) => {
+                    // Unparseable entry in XFF — fail closed.
+                    tracing::warn!("Blocked chat POST: malformed XFF entry {:?}", ip_str.trim());
+                    return Err(ErrorResponse { error: "Blocked by Node Firewall: malformed forwarding header.".into() });
+                }
+            }
+        }
+    }
+
+    // X-Real-IP is set by Nginx itself (single value), so check it independently.
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|h| h.to_str().ok()) {
+        match real_ip.trim().parse::<std::net::IpAddr>() {
+            Ok(ip) if !check_is_lan(ip) => {
+                tracing::warn!("Blocked Nginx-proxied WAN access to chat POST from X-Real-IP {}", ip);
+                return Err(ErrorResponse { error: "Blocked by Node Firewall: You can only send messages from the local network.".into() });
+            }
+            Ok(_) | Err(_) => {} // LAN or unparseable; XFF was the authoritative check above
+        }
+    }
+    // -----------------------------------------
+
+    // Allow attachment-only messages; require at least one word OR one attachment.
+    if req.words.is_empty() && req.attachments.is_empty() {
+        return Err(ErrorResponse {
+            error: "Message must contain at least one word or one attachment".into(),
+        });
+    }
+    if req.words.len() > 10 {
+        return Err(ErrorResponse { error: "Message must contain at most 10 words".into() });
+    }
+    if req.words.iter().any(|&w| (w as usize) >= crate::node::CHAT_DICTIONARY.len()) {
+        return Err(ErrorResponse { error: "Invalid word index".into() });
+    }
+    if req.attachments.len() > crate::node::MAX_CHAT_ATTACHMENTS {
+        return Err(ErrorResponse { error: "Too many attachments (max 4)".into() });
+    }
+    if req.attachments.iter().any(|att| att.is_graffiti()) {
+        return Err(ErrorResponse { 
+            error: "Attachment payload rejected: must be a valid cryptographic hash, not text.".into() 
+        });
+    }
+    // --- 2. GLOBAL RPC OUTBOX RATE LIMITER ---
+    {
+        let mut limiter = node.outbox_chat_limiter.lock().await;
+        let now = std::time::Instant::now();
+        if now.duration_since(limiter.1).as_secs() >= 10 {
+            *limiter = (0, now);
+        }
+        limiter.0 += 1;
+        if limiter.0 > 5 {
+            return Err(ErrorResponse { error: "Node rate limit exceeded (Max 5 per 10s).".into() });
+        }
+    }
+    // -----------------------------------------
+    
+   
+    node.send_chat(req.words, req.reply_to, req.attachments)
+        .map_err(|e| ErrorResponse { error: e.to_string() })?;
+    
+    Ok(Json(serde_json::json!({ "status": "sent" })))
+}
+
+pub async fn chat_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("chat.html"))
+}
+pub async fn mirstat_css() -> impl IntoResponse {
+    (
+        [("Content-Type", "text/css")],
+        include_str!("mirstat.css"),
+    )
+}

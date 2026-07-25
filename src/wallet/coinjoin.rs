@@ -1,0 +1,1216 @@
+//! Denomination-uniform CoinJoin mixing.
+//!
+//! Constructs joint transactions where N participants each contribute one input
+//! of the same power-of-2 denomination and each receive one output of that
+//! denomination. An additional denomination-1 fee input covers the mandatory
+//! tx fee. On-chain, the transaction is a perfect permutation — subset sum
+//! analysis yields zero information about the input→output mapping.
+//!
+//! # Protocol overview
+//!
+//! 1. Initiator creates a [`MixSession`] for a denomination (e.g. 8).
+//! 2. Participants register via [`MixSession::register`] with their input
+//!    coin and desired output address.
+//! 3. One participant (the separate fee donor) sets a fee input whose value is at least
+//!    [`recommended_fee_for_mix`] via [`MixSession::set_fee_input`].
+//! 4. Once ready, [`MixSession::proposal`] returns a deterministic [`MixProposal`]
+//!    containing the canonical input/output ordering and commitment hash.
+//! 5. Each participant signs the commitment for their own input.
+//! 6. [`MixSession::build_reveal`] assembles the final `Reveal` transaction.
+//!
+//! No consensus changes required. The resulting `Commit`/`Reveal` pair is
+//! indistinguishable from a normal multi-input transaction.
+//!
+//! ```
+//! use mirstat::core::types::*;
+//! use mirstat::core::wots;
+//! use mirstat::wallet::coinjoin::*;
+//!
+//! let mut session = MixSession::new(8, 2).unwrap();
+//!
+//! // Alice: input 8, output 8 to fresh address
+//! let seed_a = hash(b"alice");
+//! let pk_a = wots::keygen(&seed_a);
+//! // Update: Use Predicate::p2pk
+//! let input_a = InputReveal { predicate: Predicate::p2pk(&pk_a), value: 8, salt: [0xAA; 32], commitment: None };
+//! let output_a = OutputData::Standard { address: hash(b"alice-dest"), value: 8, salt: [0xBB; 32] };
+//! session.register(input_a, output_a).unwrap();
+//!
+//! // Bob: input 8, output 8 to fresh address
+//! let seed_b = hash(b"bob");
+//! let pk_b = wots::keygen(&seed_b);
+//! let input_b = InputReveal { predicate: Predicate::p2pk(&pk_b), value: 8, salt: [0xCC; 32] , commitment: None};
+//! let output_b = OutputData::Standard { address: hash(b"bob-dest"), value: 8, salt: [0xDD; 32] };
+//! session.register(input_b, output_b).unwrap();
+//!
+//! // Fee coin (value must be >= recommended_fee_for_mix(2) for a 2-participant mix)
+//! let seed_f = hash(b"fee");
+//! let pk_f = wots::keygen(&seed_f);
+//! let min_fee = recommended_fee_for_mix(2);
+//! let fee_input = InputReveal { predicate: Predicate::p2pk(&pk_f), value: min_fee, salt: [0xEE; 32], commitment: None };
+//! session.set_fee_input(fee_input).unwrap();
+//!
+//! let proposal = session.proposal().unwrap();
+//! assert_eq!(proposal.inputs.len(), 3);  // 2 mix + 1 fee donor
+//! assert_eq!(proposal.outputs.len(), 2); // 2 mix outputs
+//!
+//! // Each participant signs the commitment for their input(s)
+//! let mut sigs = vec![Vec::new(); proposal.inputs.len()];
+//! for (i, input) in proposal.inputs.iter().enumerate() {
+//!     // Update: Extract PK from script
+//!     let pk = input.predicate.owner_pk().unwrap();
+//!     let seed = if pk == pk_a { &seed_a }
+//!         else if pk == pk_b { &seed_b }
+//!         else { &seed_f };
+//!     sigs[i] = wots::sig_to_bytes(&wots::sign(seed, &proposal.commitment));
+//! }
+//!
+//! let reveal = session.build_reveal(sigs).unwrap();
+//! match &reveal {
+//!     mirstat::core::types::Transaction::Reveal { inputs, outputs, .. } => {
+//!         assert_eq!(inputs.len(), 3);
+//!         assert_eq!(outputs.len(), 2);
+//!     }
+//!     _ => panic!("expected Reveal"),
+//! }
+//! ```
+
+use crate::core::types::*;
+use anyhow::{bail, Result};
+
+/// Minimum participants in a mix (excluding the fee donor).
+pub const MIN_MIX_PARTICIPANTS: usize = 2;
+
+/// Maximum participants in a single mix session.
+pub const MAX_MIX_PARTICIPANTS: usize = 16;
+
+/// Conservative estimate (in bytes) of the serialized size of a `Reveal`
+/// transaction for a uniform-denomination mix with `num_mix_participants`
+/// mix inputs + exactly one additional fee input.
+///
+/// This is used to compute the minimum fee the separate fee donor must supply
+/// so that the resulting Reveal passes the mempool's MIN_FEE_PER_KB admission check.
+///
+/// The estimate is deliberately conservative (over-estimates) because:
+/// - WOTS signatures (576 bytes each) dominate the size.
+/// - We must pass mempool validation even after full bincode serialization.
+///
+/// MUST BE KEPT REASONABLY IN SYNC with mempool.rs admission rules.
+pub fn estimated_mix_reveal_size(num_mix_participants: usize) -> u64 {
+    let total_inputs = num_mix_participants + 1; // + fee donor
+    let total_outputs = num_mix_participants;
+
+    // Very conservative per-input / per-output sizing.
+    // Real sizes vary with Predicate encoding, but this errs on the side of requiring
+    // a slightly larger fee coin (harmless — the excess simply becomes part of the fee).
+    const BASE_OVERHEAD: u64 = 256;
+    const PER_INPUT: u64 = 32 /*Predicate overhead*/ + 576 /*WOTS sig*/ + 32 /*value*/ + 32 /*salt*/ + 32 /*coin_id-ish*/;
+    const PER_OUTPUT: u64 = 64 /*OutputData overhead*/ + 32 /*value*/ + 32 /*salt*/ + 32 /*address*/;
+
+    BASE_OVERHEAD + (total_inputs as u64 * PER_INPUT) + (total_outputs as u64 * PER_OUTPUT)
+}
+
+/// Returns the minimum value the separate fee-donor input must have for a mix
+/// with the given number of mix participants (not counting the donor).
+///
+/// This uses the same MIN_FEE_PER_KB / size logic as the mempool so that
+/// a Reveal produced by this session will be accepted by the network.
+///
+/// The fee donor remains a distinct participant (per current protocol design).
+pub fn recommended_fee_for_mix(num_mix_participants: usize) -> u64 {
+    // These two constants MUST match the ones in mempool.rs.
+    const MIN_FEE_PER_KB: u64 = 10;
+    const FEE_RATE_SCALE: u128 = 1_024;
+
+    let bytes = estimated_mix_reveal_size(num_mix_participants);
+    if bytes == 0 {
+        return 0;
+    }
+    // Ceiling division: ceil( bytes * MIN_FEE_PER_KB / FEE_RATE_SCALE )
+    let numerator = (bytes as u128) * (MIN_FEE_PER_KB as u128);
+    let required = (numerator + FEE_RATE_SCALE - 1) / FEE_RATE_SCALE;
+    required as u64
+}
+
+/// A single participant's contribution to a mix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MixRegistration {
+    pub input: InputReveal,
+    pub output: OutputData,
+}
+
+/// A deterministic, canonical proposal that all participants can
+/// independently verify and sign.
+#[derive(Clone, Debug)]
+pub struct MixProposal {
+    /// Canonical inputs: mix inputs sorted by coin_id, fee input last.
+    pub inputs: Vec<InputReveal>,
+    /// Canonical outputs: sorted by coin_id.
+    pub outputs: Vec<OutputData>,
+    pub salt: [u8; 32],
+    pub commitment: [u8; 32],
+}
+
+/// A denomination-uniform mix session.
+///
+/// Collects registrations, validates denomination uniformity, and produces
+/// a canonical transaction proposal. Pure data — no IO or networking.
+pub struct MixSession {
+    denomination: u64,
+    min_participants: usize,
+    salt: [u8; 32],
+    registrations: Vec<MixRegistration>,
+    fee_input: Option<InputReveal>,
+}
+
+impl MixSession {
+    /// Create a new mix session for the given power-of-2 denomination.
+    ///
+    /// `min_participants` is clamped to `[MIN_MIX_PARTICIPANTS, MAX_MIX_PARTICIPANTS]`.
+    pub fn new(denomination: u64, min_participants: usize) -> Result<Self> {
+        if denomination == 0 || !denomination.is_power_of_two() {
+            bail!("denomination must be a nonzero power of 2, got {}", denomination);
+        }
+        let min = min_participants.clamp(MIN_MIX_PARTICIPANTS, MAX_MIX_PARTICIPANTS);
+        let salt: [u8; 32] = rand::random();
+        Ok(Self {
+            denomination,
+            min_participants: min,
+            salt,
+            registrations: Vec::new(),
+            fee_input: None,
+        })
+    }
+
+    /// Create a session with a specific salt (for deterministic testing).
+    #[cfg(test)]
+    pub fn with_salt(denomination: u64, min_participants: usize, salt: [u8; 32]) -> Result<Self> {
+        if denomination == 0 || !denomination.is_power_of_two() {
+            bail!("denomination must be a nonzero power of 2, got {}", denomination);
+        }
+        let min = min_participants.clamp(MIN_MIX_PARTICIPANTS, MAX_MIX_PARTICIPANTS);
+        Ok(Self {
+            denomination,
+            min_participants: min,
+            salt,
+            registrations: Vec::new(),
+            fee_input: None,
+        })
+    }
+
+    pub fn denomination(&self) -> u64 {
+        self.denomination
+    }
+
+    pub fn participant_count(&self) -> usize {
+        self.registrations.len()
+    }
+
+    pub fn has_fee_input(&self) -> bool {
+        self.fee_input.is_some()
+    }
+
+    /// Register a participant's input and output.
+    ///
+    /// Both must have value equal to the session denomination.
+    /// Rejects duplicate inputs (same coin_id).
+    pub fn register(&mut self, input: InputReveal, output: OutputData) -> Result<()> {
+        // --- FIX: Prevent P2P DataBurn Injection ---
+        if matches!(output, OutputData::DataBurn { .. }) {
+            bail!("DataBurn outputs are strictly forbidden in CoinJoin mixes");
+        }
+        // -------------------------------------------
+
+        if self.registrations.len() >= MAX_MIX_PARTICIPANTS {
+            bail!("session full ({} participants)", MAX_MIX_PARTICIPANTS);
+        }
+        if input.value != self.denomination {
+            bail!(
+                "input value {} != session denomination {}",
+                input.value, self.denomination
+            );
+        }
+        if output.value() != self.denomination {
+            bail!(
+                "output value {} != session denomination {}",
+                output.value(), self.denomination
+            );
+        }
+        let coin_id = input.coin_id();
+        if self.registrations.iter().any(|r| r.input.coin_id() == coin_id) {
+            bail!("duplicate input coin");
+        }
+        self.registrations.push(MixRegistration { input, output });
+        Ok(())
+    }
+
+    /// Set the fee input supplied by a separate fee donor.
+    ///
+    /// Exactly one fee input per session. The value must be **at least** the
+    /// amount returned by `recommended_fee_for_mix(self.registrations.len())`
+    /// at the time this method is called (or higher if more participants join later).
+    ///
+    /// The fee donor is a distinct participant from the mix participants (per
+    /// current protocol design). Their entire input value becomes the transaction fee.
+    ///
+    /// # Reasoning
+    /// The original design hardcoded the fee input to denomination exactly 1 under the
+    /// assumption that all Reveals had a trivial fixed fee. The mempool later introduced
+    /// a strict size-based minimum fee rate (MIN_FEE_PER_KB = 10). Mix Reveals carrying
+    /// multiple 576-byte WOTS signatures easily exceed the size that a fee of 1 can satisfy,
+    /// causing every mix to be rejected by the mempool with "Fee rate too low".
+    ///
+    /// This change makes the required fee dynamic and derived from the same policy the
+    /// mempool will enforce, while preserving the separate-donor model and the uniform
+    /// permutation property of the mix.
+    ///
+    /// # Formal Specification
+    ///
+    /// Pre:
+    ///   - `self.fee_input` is None
+    ///   - `input.value > 0`
+    ///   - `input.coin_id()` does not collide with any registered mix input
+    ///   - `input.value >= recommended_fee_for_mix(self.registrations.len())`  (checked here and again at proposal())
+    ///
+    /// Post:
+    ///   (success)
+    ///     self.fee_input = Some(input)
+    ///     self.fee_input.value >= recommended_fee_for_mix(at call time)
+    ///   (failure)
+    ///     self is unchanged
+    ///
+    /// ```zed
+    ///     SetFeeInput
+    ///     ----------------
+    ///     ΔMixSession
+    ///     input? : InputReveal
+    ///     required : ℕ
+    ///
+    ///     pre  fee_input = ∅
+    ///     pre  input?.value ≥ required   (where required = recommended_fee_for_mix(|registrations|))
+    ///     pre  input?.coin_id ∉ { r.input.coin_id | r ∈ registrations }
+    ///     post fee_input' = input?
+    /// ```
+    /// Nominate the separate fee-donor input for this mix.
+    ///
+    /// # Reasoning
+    ///
+    /// The donor is a distinct participant from the mixers, and it must be a
+    /// distinct *key* as well as a distinct coin. The check here was previously
+    /// `coin_id` equality, which is the right test for double-spending the same
+    /// UTXO but the wrong one for this chain: `coin_id = H(address ‖ value ‖
+    /// salt)`, so two coins at one address with different values are different
+    /// coin ids and passed cleanly.
+    ///
+    /// On mirstat that is not a benign case. Every spend authorises with a
+    /// WOTS one-time key, and an address *is* a key. A mix reveal signs each
+    /// input separately, so admitting a donor at an address already registered
+    /// as a mix input produces two WOTS signatures under one key in a single
+    /// transaction — which is the exact condition under which WOTS becomes
+    /// forgeable, published to the chain, for anyone watching to exploit. The
+    /// wallet defends against this locally by keeping same-address coins in
+    /// indivisible sibling bundles, but a mix session assembles inputs from
+    /// peers whose wallets it does not control, so it has to enforce the rule
+    /// itself.
+    ///
+    /// Address collision is therefore the stricter and correct test, and it
+    /// subsumes the coin-id case: equal coin ids imply equal addresses.
+    ///
+    /// # Formal Specification
+    ///
+    /// ```text
+    /// Pre:
+    ///   - fee_input = None
+    ///   - input?.address ∉ { r.input.address | r ∈ registrations }
+    ///   - input?.value > 0
+    ///   - input?.value ≥ recommended_fee_for_mix(#registrations)
+    ///
+    /// Post:
+    ///   result = Ok(())  ⇒ fee_input' = Some(input?)
+    ///   result = Err(_)  ⇒ fee_input' = fee_input        (session unchanged)
+    /// ```
+    ///
+    /// ```zed
+    ///     SetFeeInput
+    ///     ----------------
+    ///     ΔMixSession
+    ///     input? : InputReveal
+    ///
+    ///     pre  fee_input = ∅
+    ///     pre  ¬ (∃ r : registrations • r.input.address = input?.address)
+    ///     pre  input?.value ≥ recommended_fee_for_mix(#registrations)
+    ///
+    ///     post fee_input'     = {input?}
+    ///     post registrations' = registrations
+    /// ```
+    ///
+    /// # Safety / Invariants
+    ///
+    /// - **One WOTS key signs once, ever.** No two inputs of an assembled mix
+    ///   may share an address. This is the invariant that makes the whole
+    ///   signature scheme sound and it cannot be recovered from after the fact.
+    /// - **The final fee check is in `proposal()`.** The bound checked here uses
+    ///   the registrations seen *so far*; participants may still join and raise
+    ///   the requirement. `proposal()` re-checks against the final count and is
+    ///   the authoritative enforcement point.
+    /// - Errors leave the session untouched, so a rejected donor does not
+    ///   consume the single `fee_input` slot.
+    pub fn set_fee_input(&mut self, input: InputReveal) -> Result<()> {
+        if self.fee_input.is_some() {
+            bail!("fee input already set");
+        }
+        // Must not share an address with any mix input. Checked by address, not
+        // coin_id: two coins at one address are two spends of one one-time key.
+        let addr = input.predicate.address();
+        if self.registrations.iter().any(|r| r.input.predicate.address() == addr) {
+            bail!(
+                "fee input reuses the address of a mix input — signing both would spend the \
+                 same one-time key twice and expose it"
+            );
+        }
+        if input.value == 0 {
+            bail!("fee input value must be greater than zero");
+        }
+        // Dynamic minimum (separate donor model preserved).
+        // We check against the number of mix participants registered *so far*.
+        // proposal() will perform a final check with the exact final count.
+        let min_required = recommended_fee_for_mix(self.registrations.len());
+        if input.value < min_required {
+            bail!(
+                "fee input value {} is below the required minimum {} for {} mix participants (use recommended_fee_for_mix)",
+                input.value, min_required, self.registrations.len()
+            );
+        }
+        self.fee_input = Some(input);
+        Ok(())
+    }
+
+    /// True when enough participants have registered and the fee input is set.
+    pub fn is_ready(&self) -> bool {
+        self.registrations.len() >= self.min_participants && self.fee_input.is_some()
+    }
+
+    /// Build the canonical proposal.
+    ///
+    /// Inputs are ordered: mix inputs sorted by coin_id, then the fee input.
+    /// Outputs are sorted by coin_id. This ordering is deterministic — all
+    /// participants independently compute the same commitment.
+    pub fn proposal(&self) -> Result<MixProposal> {
+        if self.registrations.len() < self.min_participants {
+            bail!(
+                "need {} participants, have {}",
+                self.min_participants,
+                self.registrations.len()
+            );
+        }
+        let fee = self.fee_input.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fee input not set"))?;
+
+        // Final dynamic fee check with the exact number of mix participants.
+        // This is the authoritative enforcement point.
+        let num_mix = self.registrations.len();
+        let required_fee = recommended_fee_for_mix(num_mix);
+        if fee.value < required_fee {
+            bail!(
+                "fee input value {} is below the required minimum {} for {} mix participants",
+                fee.value, required_fee, num_mix
+            );
+        }
+
+        // Canonical input order: mix inputs sorted by coin_id, fee last.
+        let mut mix_inputs: Vec<InputReveal> = self.registrations
+            .iter()
+            .map(|r| r.input.clone())
+            .collect();
+        mix_inputs.sort_by_key(|i| i.coin_id());
+        let mut inputs = mix_inputs;
+        inputs.push(fee.clone());
+
+        // Canonical output order: sorted by coin_id.
+        let mut outputs: Vec<OutputData> = self.registrations
+            .iter()
+            .map(|r| r.output.clone())
+            .collect();
+        outputs.sort_by_key(|o| o.coin_id());
+
+        let input_coin_ids: Vec<[u8; 32]> = inputs.iter().map(|i| i.coin_id()).collect();
+        let output_commit_hashes: Vec<[u8; 32]> = outputs.iter().map(|o| o.hash_for_commitment()).collect();
+        let commitment = compute_commitment(&input_coin_ids, &output_commit_hashes, &self.salt);
+
+        Ok(MixProposal {
+            inputs,
+            outputs,
+            salt: self.salt,
+            commitment,
+        })
+    }
+
+    /// Assemble the final `Reveal` transaction from collected signatures.
+    ///
+    /// `signatures` must correspond 1:1 with `proposal().inputs` in the same order.
+    /// Each participant signs the commitment with their own key; the caller
+    /// collects all signatures and passes them here.
+    pub fn build_reveal(&self, signatures: Vec<Vec<u8>>) -> Result<Transaction> {
+        let proposal = self.proposal()?;
+        if signatures.len() != proposal.inputs.len() {
+            bail!("expected {} signatures", proposal.inputs.len());
+        }
+        let witnesses = signatures.into_iter().map(Witness::sig).collect();
+        
+        Ok(Transaction::Reveal {
+            inputs: proposal.inputs,
+            witnesses,
+            outputs: proposal.outputs,
+            salt: proposal.salt,
+        })
+    }
+}
+
+/// Validate that a `Reveal` transaction has the structure of a denomination-uniform
+/// CoinJoin: all mix inputs share one denomination, all outputs share that denomination,
+/// and at most one input has denomination 1 (fee).
+///
+/// This is a heuristic check for observers/analysis; the consensus layer validates
+/// the transaction normally regardless.
+/// Recognise a canonical uniform CoinJoin.
+///
+/// # Reasoning
+///
+/// This is the shape test an observer — a relay applying mix-aware policy, an
+/// analytics consumer, a wallet deciding whether a transaction it sees is a mix
+/// — applies to a reveal. It previously identified the fee donor by the literal
+/// `input.value == 1`, which was true only while the donor paid a flat
+/// one-unit fee. Once the donor's contribution became size-derived
+/// (`recommended_fee_for_mix`), that predicate matched nothing: a real
+/// two-party mix pays 27, so `fee_count` was 0, the arm
+/// `mix_count + fee_count == inputs.len()` failed, and **every genuine CoinJoin
+/// was reported as not being one**.
+///
+/// The function has no production callers today, which is the only reason this
+/// was invisible. That is worth resolving in one direction or the other: if
+/// relay policy is meant to consult it, this bug would have silently disabled
+/// that policy; if nothing will ever consult it, it should be deleted rather
+/// than left as a trap for whoever wires it up next.
+///
+/// The rule is now expressed in terms of value conservation rather than a magic
+/// constant, so it cannot drift with the fee model again: a mix is *n* mixers
+/// plus exactly one donor, every output at one power-of-two denomination, and a
+/// surplus that covers the fee the session would have required.
+///
+/// # Formal Specification
+///
+/// ```text
+/// Pre: true (pure; reads no state)
+///
+/// Post: result = true ⇔
+///     tx is Reveal
+///   ∧ #outputs ≥ MIN_MIX_PARTICIPANTS
+///   ∧ #inputs  = #outputs + 1
+///   ∧ ∃ d : ℕ • d > 0 ∧ power_of_two(d) ∧ ∀ o ∈ outputs • o.value = d
+///   ∧ #{ i ∈ inputs | i.value = d } ≥ #outputs
+///   ∧ Σ inputs.value − Σ outputs.value ≥ recommended_fee_for_mix(#outputs)
+/// ```
+///
+/// ```zed
+///     IsUniformMix
+///     ----------------
+///     ΞTransaction
+///     result! : 𝔹
+///
+///     pre  true
+///
+///     post result! = ( #outputs ≥ MIN_MIX_PARTICIPANTS
+///                    ∧ #inputs = #outputs + 1
+///                    ∧ (∃ d • d ∈ powers_of_two ∧ (∀ o : outputs • o.value = d))
+///                    ∧ #(inputs ▷ {d}) ≥ #outputs
+///                    ∧ (Σ inputs.value) − (Σ outputs.value)
+///                        ≥ recommended_fee_for_mix(#outputs) )
+/// ```
+///
+/// # Safety / Invariants
+///
+/// - **Denomination-agnostic.** The donor may legitimately hold a coin at the
+///   mix denomination, so the donor is identified by arity and surplus, never
+///   by a distinguished value.
+/// - **No false positives on under-paid mixes.** A transaction of the right
+///   shape that does not actually cover the mix fee is not a canonical mix, or
+///   the predicate could be used to claim mix-policy treatment without paying
+///   for it.
+/// - Must agree with `MixSession::proposal`, which is the authoritative
+///   constructor. Any change to the fee model must be reflected in both.
+pub fn is_uniform_mix(tx: &Transaction) -> bool {
+    let (inputs, outputs) = match tx {
+        Transaction::Reveal { inputs, outputs, .. } => (inputs, outputs),
+        _ => return false,
+    };
+
+    if outputs.len() < MIN_MIX_PARTICIPANTS {
+        return false;
+    }
+    // Exactly the mixers plus a single fee donor.
+    if inputs.len() != outputs.len() + 1 {
+        return false;
+    }
+
+    // All outputs must share the same power-of-2 denomination.
+    let denom = outputs[0].value();
+    if denom == 0 || !denom.is_power_of_two() {
+        return false;
+    }
+    if !outputs.iter().all(|o| o.value() == denom) {
+        return false;
+    }
+
+    // The mixers sit at that denomination. The donor may or may not, so this is
+    // a lower bound rather than an equality.
+    if inputs.iter().filter(|i| i.value == denom).count() < outputs.len() {
+        return false;
+    }
+
+    // Whatever the inputs exceed the outputs by is the fee, and it has to cover
+    // a mix of this size.
+    let in_sum: u64 = inputs.iter().map(|i| i.value).sum();
+    let out_sum: u64 = outputs.iter().map(|o| o.value()).sum();
+    in_sum.saturating_sub(out_sum) >= recommended_fee_for_mix(outputs.len())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::wots;
+    use crate::core::types::{Predicate, Witness};
+
+    fn make_participant(name: &[u8]) -> ([u8; 32], InputReveal, OutputData) {
+        let seed = hash(name);
+        let pk = wots::keygen(&seed);
+        let input = InputReveal {
+            predicate: Predicate::p2pk(&pk),
+            value: 8,
+            salt: hash_concat(name, b"input-salt"),
+            commitment: None,
+        };
+        let output = OutputData::Standard {
+            address: hash_concat(name, b"dest"),
+            value: 8,
+            salt: hash_concat(name, b"output-salt"),
+        };
+        (seed, input, output)
+    }
+
+    fn make_fee_participant(name: &[u8], required_fee: u64) -> ([u8; 32], InputReveal) {
+        let seed = hash(name);
+        let pk = wots::keygen(&seed);
+        let input = InputReveal {
+            predicate: Predicate::p2pk(&pk),
+            value: required_fee,
+            salt: hash_concat(name, b"fee-salt"),
+            commitment: None,
+        };
+        (seed, input)
+    }
+
+    fn ready_session() -> (MixSession, Vec<([u8; 32], InputReveal)>) {
+        let mut session = MixSession::with_salt(8, 2, [0x42; 32]).unwrap();
+
+        let (seed_a, in_a, out_a) = make_participant(b"alice");
+        let (seed_b, in_b, out_b) = make_participant(b"bob");
+        let required_fee = recommended_fee_for_mix(2);
+        let (seed_f, fee) = make_fee_participant(b"fee-donor", required_fee);
+
+        session.register(in_a.clone(), out_a).unwrap();
+        session.register(in_b.clone(), out_b).unwrap();
+        session.set_fee_input(fee.clone()).unwrap();
+
+        let seeds = vec![
+            (seed_a, in_a),
+            (seed_b, in_b),
+            (seed_f, fee),
+        ];
+        (session, seeds)
+    }
+
+    // ── Construction ────────────────────────────────────────────────────
+
+    #[test]
+    fn new_rejects_zero_denomination() {
+        assert!(MixSession::new(0, 2).is_err());
+    }
+
+    #[test]
+    fn new_rejects_non_power_of_two() {
+        assert!(MixSession::new(3, 2).is_err());
+        assert!(MixSession::new(6, 2).is_err());
+        assert!(MixSession::new(15, 2).is_err());
+    }
+
+    #[test]
+    fn new_accepts_valid_denominations() {
+        for d in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+            assert!(MixSession::new(d, 2).is_ok());
+        }
+    }
+
+    #[test]
+    fn min_participants_clamped() {
+        let s = MixSession::new(8, 0).unwrap();
+        assert_eq!(s.min_participants, MIN_MIX_PARTICIPANTS);
+
+        let s = MixSession::new(8, 100).unwrap();
+        assert_eq!(s.min_participants, MAX_MIX_PARTICIPANTS);
+    }
+
+    // ── Registration ────────────────────────────────────────────────────
+
+    #[test]
+    fn register_accepts_matching_denomination() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let (_, input, output) = make_participant(b"alice");
+        assert!(s.register(input, output).is_ok());
+        assert_eq!(s.participant_count(), 1);
+    }
+
+    #[test]
+    fn register_rejects_wrong_input_denomination() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let seed = hash(b"bad");
+        let pk = wots::keygen(&seed);
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 4, salt: [0; 32] , commitment: None };
+        let output = OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] };
+        assert!(s.register(input, output).is_err());
+    }
+
+    #[test]
+    fn register_rejects_wrong_output_denomination() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let seed = hash(b"bad");
+        let pk = wots::keygen(&seed);
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 8, salt: [0; 32] , commitment: None };
+        let output = OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] };
+        assert!(s.register(input, output).is_err());
+    }
+
+    #[test]
+    fn register_rejects_duplicate_input() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let (_, input, output) = make_participant(b"alice");
+        s.register(input.clone(), output.clone()).unwrap();
+
+        let output2 = OutputData::Standard { address: hash(b"other"), value: 8, salt: [0xFF; 32] };
+        assert!(s.register(input, output2).is_err());
+    }
+
+    #[test]
+    fn register_rejects_when_full() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        for i in 0..MAX_MIX_PARTICIPANTS {
+            let (_, input, output) = make_participant(&[i as u8; 4]);
+            s.register(input, output).unwrap();
+        }
+        let (_, input, output) = make_participant(b"overflow");
+        assert!(s.register(input, output).is_err());
+    }
+
+    // ── Fee input ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fee_input_accepts_sufficient_fee() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
+        assert!(s.set_fee_input(fee).is_ok());
+        assert!(s.has_fee_input());
+    }
+
+    #[test]
+    fn fee_input_rejects_insufficient_fee() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        // For 2 mix participants the required fee is > 1
+        let input = InputReveal { predicate: Predicate::p2pk(&[1;32]), value: 1, salt: [0; 32] , commitment: None };
+        assert!(s.set_fee_input(input).is_err());
+    }
+
+    #[test]
+    fn fee_input_rejects_double_set() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let required = recommended_fee_for_mix(2);
+        let (_, fee1) = make_fee_participant(b"fee1", required);
+        let (_, fee2) = make_fee_participant(b"fee2", required);
+        s.set_fee_input(fee1).unwrap();
+        assert!(s.set_fee_input(fee2).is_err());
+    }
+
+    #[test]
+    fn fee_input_rejects_collision_with_mix_input() {
+        let mut s = MixSession::new(1, 2).unwrap();
+        // Register a small mix input (value 1 is fine here as mix input)
+        let seed = hash(b"collider");
+        let pk = wots::keygen(&seed);
+        let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [0xAA; 32] , commitment: None };
+        let output = OutputData::Standard { address: hash(b"dest"), value: 1, salt: [0xBB; 32] };
+        s.register(input.clone(), output).unwrap();
+
+        // Same coin as fee should fail (even if value would be sufficient)
+        let required = recommended_fee_for_mix(2);
+        let bad_fee = InputReveal { predicate: Predicate::p2pk(&pk), value: required, salt: [0xAA; 32] , commitment: None };
+        assert!(s.set_fee_input(bad_fee).is_err());
+    }
+
+    // ── Readiness ───────────────────────────────────────────────────────
+
+    #[test]
+    fn not_ready_without_enough_participants() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
+        s.set_fee_input(fee).unwrap();
+
+        let (_, input, output) = make_participant(b"alice");
+        s.register(input, output).unwrap();
+        assert!(!s.is_ready()); // only 1 of 2
+    }
+
+    #[test]
+    fn not_ready_without_fee() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let (_, in_a, out_a) = make_participant(b"alice");
+        let (_, in_b, out_b) = make_participant(b"bob");
+        s.register(in_a, out_a).unwrap();
+        s.register(in_b, out_b).unwrap();
+        assert!(!s.is_ready());
+    }
+
+    #[test]
+    fn ready_with_participants_and_fee() {
+        let (session, _) = ready_session();
+        assert!(session.is_ready());
+    }
+
+    // ── Proposal ────────────────────────────────────────────────────────
+
+    #[test]
+    fn proposal_fails_without_enough_participants() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let (_, in_a, out_a) = make_participant(b"alice");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
+        s.register(in_a, out_a).unwrap();
+        s.set_fee_input(fee).unwrap();
+        assert!(s.proposal().is_err());
+    }
+
+    #[test]
+    fn proposal_fails_without_fee() {
+        let mut s = MixSession::new(8, 2).unwrap();
+        let (_, in_a, out_a) = make_participant(b"alice");
+        let (_, in_b, out_b) = make_participant(b"bob");
+        s.register(in_a, out_a).unwrap();
+        s.register(in_b, out_b).unwrap();
+        assert!(s.proposal().is_err());
+    }
+
+    #[test]
+    fn proposal_has_correct_counts() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+        assert_eq!(p.inputs.len(), 3);  // 2 mix + 1 fee
+        assert_eq!(p.outputs.len(), 2);
+    }
+
+    #[test]
+    fn proposal_fee_input_is_last() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+        // The donor pays the size-derived fee, not a flat unit.
+        assert_eq!(p.inputs.last().unwrap().value, recommended_fee_for_mix(2));
+        // All preceding inputs are the mix denomination
+        for input in &p.inputs[..p.inputs.len() - 1] {
+            assert_eq!(input.value, 8);
+        }
+    }
+
+    #[test]
+    fn proposal_inputs_sorted_by_coin_id() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+        // Mix inputs (all but last) should be sorted by coin_id
+        let mix_ids: Vec<[u8; 32]> = p.inputs[..p.inputs.len() - 1]
+            .iter()
+            .map(|i| i.coin_id())
+            .collect();
+        let mut sorted = mix_ids.clone();
+        sorted.sort();
+        assert_eq!(mix_ids, sorted);
+    }
+
+    #[test]
+    fn proposal_outputs_sorted_by_coin_id() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+        let out_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id().unwrap()).collect();
+        let mut sorted = out_ids.clone();
+        sorted.sort();
+        assert_eq!(out_ids, sorted);
+    }
+
+    #[test]
+    fn proposal_value_conservation() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+        let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
+        assert!(in_sum > out_sum);
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(2));
+    }
+
+    #[test]
+    fn proposal_commitment_is_deterministic() {
+        let (session, _) = ready_session();
+        let p1 = session.proposal().unwrap();
+        let p2 = session.proposal().unwrap();
+        assert_eq!(p1.commitment, p2.commitment);
+        assert_eq!(p1.salt, p2.salt);
+    }
+
+    #[test]
+    fn proposal_commitment_matches_compute_commitment() {
+        let (session, _) = ready_session();
+        let p = session.proposal().unwrap();
+
+        let input_ids: Vec<[u8; 32]> = p.inputs.iter().map(|i| i.coin_id()).collect();
+        let output_ids: Vec<[u8; 32]> = p.outputs.iter().map(|o| o.coin_id().unwrap()).collect();
+        let expected = compute_commitment(&input_ids, &output_ids, &p.salt);
+        assert_eq!(p.commitment, expected);
+    }
+
+    // ── build_reveal ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_reveal_wrong_sig_count() {
+        let (session, _) = ready_session();
+        assert!(session.build_reveal(vec![]).is_err());
+        assert!(session.build_reveal(vec![vec![]; 2]).is_err()); // need 3
+    }
+
+    #[test]
+    fn build_reveal_produces_valid_reveal() {
+        let (session, seeds) = ready_session();
+        let proposal = session.proposal().unwrap();
+
+        let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
+            let seed = seeds.iter()
+                .find(|(_, i)| i.predicate == input.predicate)
+                .unwrap().0;
+            wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
+        }).collect();
+
+        let tx = session.build_reveal(sigs).unwrap();
+        match &tx {
+            Transaction::Reveal { inputs, witnesses, outputs, salt } => {
+                assert_eq!(inputs.len(), 3);
+                assert_eq!(witnesses.len(), 3);
+                assert_eq!(outputs.len(), 2);
+                assert_eq!(*salt, proposal.salt);
+            }
+            _ => panic!("expected Reveal"),
+        }
+    }
+
+    #[test]
+    fn build_reveal_signatures_verify() {
+        let (session, seeds) = ready_session();
+        let proposal = session.proposal().unwrap();
+
+        let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
+            let seed = seeds.iter()
+                .find(|(_, i)| i.predicate == input.predicate)
+                .unwrap().0;
+            wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
+        }).collect();
+
+        let tx = session.build_reveal(sigs).unwrap();
+        if let Transaction::Reveal { inputs, witnesses, .. } = &tx {
+            for (input, witness) in inputs.iter().zip(witnesses.iter()) {
+                let Witness::ScriptInputs(wit_inputs) = witness;
+                if let (Some(owner_pk), Some(sig_bytes)) = (input.predicate.owner_pk(), wit_inputs.first()) {
+                    let sig = wots::sig_from_bytes(sig_bytes).unwrap();
+                    assert!(wots::verify(&sig, &proposal.commitment, &owner_pk));
+                }
+            }
+        }
+    }
+
+    // ── is_uniform_mix ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_uniform_mix_true_for_coinjoin() {
+        let (session, seeds) = ready_session();
+        let proposal = session.proposal().unwrap();
+        let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
+            let seed = seeds.iter()
+                .find(|(_, i)| i.predicate == input.predicate)
+                .unwrap().0;
+            wots::sig_to_bytes(&wots::sign(&seed, &proposal.commitment))
+        }).collect();
+        let tx = session.build_reveal(sigs).unwrap();
+        assert!(is_uniform_mix(&tx));
+    }
+
+    #[test]
+    fn is_uniform_mix_false_for_commit() {
+        let tx = Transaction::Commit { commitment: [0; 32], spam_nonce: 0 };
+        assert!(!is_uniform_mix(&tx));
+    }
+
+    #[test]
+    fn is_uniform_mix_false_for_non_uniform_outputs() {
+        let tx = Transaction::Reveal {
+            inputs: vec![
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[3; 32]), value: 1, salt: [0; 32] , commitment: None },
+            ],
+            witnesses: vec![Witness::sig(vec![]); 3],
+            outputs: vec![
+                OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] },
+                OutputData::Standard { address: [0; 32], value: 4, salt: [0; 32] }, // mismatch
+            ],
+            salt: [0; 32],
+        };
+        assert!(!is_uniform_mix(&tx));
+    }
+
+    #[test]
+    fn is_uniform_mix_false_for_too_few_participants() {
+        // 1 mix input + 1 fee = 2 inputs, 1 output → below MIN_MIX_PARTICIPANTS
+        let tx = Transaction::Reveal {
+            inputs: vec![
+                InputReveal { predicate: Predicate::p2pk(&[1; 32]), value: 8, salt: [0; 32] , commitment: None },
+                InputReveal { predicate: Predicate::p2pk(&[2; 32]), value: 1, salt: [0; 32], commitment: None  },
+            ],
+            witnesses: vec![Witness::sig(vec![]); 2],
+            outputs: vec![
+                OutputData::Standard { address: [0; 32], value: 8, salt: [0; 32] },
+            ],
+            salt: [0; 32],
+        };
+        assert!(!is_uniform_mix(&tx));
+    }
+
+    // ── End-to-end with consensus ───────────────────────────────────────
+
+    #[test]
+    fn coinjoin_passes_consensus_validation() {
+        use crate::core::transaction::apply_transaction;
+        use crate::core::mmr::UtxoAccumulator;
+
+        let mut state = State {
+            mirstat: [0u8; 32],
+            coins: UtxoAccumulator::new(),
+            commitments: UtxoAccumulator::new(),
+            depth: 0,
+            target: [0xff; 32],
+            height: 1,
+            timestamp: 1000,
+            commitment_heights: im::HashMap::new(),
+            expirations: im::OrdMap::new(),
+            header_hash: [0u8; 32],
+            chain_mmr: crate::core::mmr::MerkleMountainRange::new(),
+            burned_wots: crate::core::mmr::UtxoAccumulator::new(),
+        };
+
+        // Create 3 coins in the UTXO set
+        let (seed_a, in_a, out_a) = make_participant(b"alice");
+        let (seed_b, in_b, out_b) = make_participant(b"bob");
+        let required_fee = recommended_fee_for_mix(2);
+        let (seed_f, fee) = make_fee_participant(b"fee-donor", required_fee);
+
+        let pk_a = in_a.predicate.owner_pk().unwrap();
+        let pk_b = in_b.predicate.owner_pk().unwrap();
+        let pk_f = fee.predicate.owner_pk().unwrap();
+        let in_a_id = in_a.coin_id();
+        let in_b_id = in_b.coin_id();
+        let fee_id = fee.coin_id();
+
+        let v2 = crate::core::types::is_v2_at(state.height);
+        state.coins.insert(in_a_id, v2);
+        state.coins.insert(in_b_id, v2);
+        state.coins.insert(fee_id, v2);
+
+        // Build the CoinJoin
+        let mut session = MixSession::with_salt(8, 2, [0x42; 32]).unwrap();
+        session.register(in_a, out_a).unwrap();
+        session.register(in_b, out_b).unwrap();
+        session.set_fee_input(fee).unwrap();
+
+        let proposal = session.proposal().unwrap();
+
+        // Mine commit PoW
+        let nonce = crate::core::transaction::mine_pow(
+            &proposal.commitment,
+            crate::core::transaction::MIN_COMMIT_POW_BITS,
+            0,
+            [0u8; 32],
+        );
+
+        // Apply Commit
+        let commit_tx = Transaction::Commit {
+            commitment: proposal.commitment,
+            spam_nonce: nonce,
+        };
+        apply_transaction(&mut state, &commit_tx).unwrap();
+
+        // Sign
+        let seeds: Vec<([u8; 32], [u8; 32])> = vec![
+            (seed_a, pk_a),
+            (seed_b, pk_b),
+            (seed_f, pk_f),
+        ];
+        let sigs: Vec<Vec<u8>> = proposal.inputs.iter().map(|input| {
+            let (seed, _) = seeds.iter()
+                .find(|(_, pk)| crate::core::types::Predicate::p2pk(pk) == input.predicate)
+                .unwrap();
+            wots::sig_to_bytes(&wots::sign(seed, &proposal.commitment))
+        }).collect();
+
+        // Apply Reveal
+        let reveal_tx = session.build_reveal(sigs).unwrap();
+        apply_transaction(&mut state, &reveal_tx).unwrap();
+
+        // Input coins spent
+        assert!(!state.coins.contains(&in_a_id));
+        assert!(!state.coins.contains(&in_b_id));
+        assert!(!state.coins.contains(&fee_id));
+
+        // Output coins created
+        if let Transaction::Reveal { outputs, .. } = &reveal_tx {
+            for o in outputs {
+                assert!(state.coins.contains(&o.coin_id().unwrap()));
+            }
+        }
+    }
+
+    // ── Three-participant session ───────────────────────────────────────
+
+    #[test]
+    fn three_participant_mix() {
+        let mut session = MixSession::with_salt(16, 3, [0x99; 32]).unwrap();
+
+        for i in 0..3u8 {
+            let name = [i; 4];
+            let seed = hash(&name);
+            let pk = wots::keygen(&seed);
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 16, salt: hash(&[i + 100]) , commitment: None };
+            let output = OutputData::Standard {
+                address: hash(&[i + 200]),
+                value: 16,
+                salt: hash(&[i + 150]),
+            };
+            session.register(input, output).unwrap();
+        }
+
+        let required = recommended_fee_for_mix(3);
+        let (_seed_f, fee) = make_fee_participant(b"fee3", required);
+        session.set_fee_input(fee).unwrap();
+
+        let p = session.proposal().unwrap();
+        assert_eq!(p.inputs.len(), 4);  // 3 mix + 1 fee
+        assert_eq!(p.outputs.len(), 3);
+
+        let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(3));
+    }
+
+    // ── Registration order doesn't affect proposal ──────────────────────
+
+    #[test]
+    fn proposal_independent_of_registration_order() {
+        let (_seed_a, in_a, out_a) = make_participant(b"alice");
+        let (_seed_b, in_b, out_b) = make_participant(b"bob");
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee", required);
+
+        let salt = [0x77; 32];
+
+        // Order 1: alice then bob
+        let mut s1 = MixSession::with_salt(8, 2, salt).unwrap();
+        s1.register(in_a.clone(), out_a.clone()).unwrap();
+        s1.register(in_b.clone(), out_b.clone()).unwrap();
+        s1.set_fee_input(fee.clone()).unwrap();
+
+        // Order 2: bob then alice
+        let mut s2 = MixSession::with_salt(8, 2, salt).unwrap();
+        s2.register(in_b, out_b).unwrap();
+        s2.register(in_a, out_a).unwrap();
+        s2.set_fee_input(fee).unwrap();
+
+        let p1 = s1.proposal().unwrap();
+        let p2 = s2.proposal().unwrap();
+
+        assert_eq!(p1.commitment, p2.commitment);
+        assert_eq!(
+            p1.inputs.iter().map(|i| i.coin_id()).collect::<Vec<_>>(),
+            p2.inputs.iter().map(|i| i.coin_id()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            p1.outputs.iter().map(|o| o.coin_id()).collect::<Vec<_>>(),
+            p2.outputs.iter().map(|o| o.coin_id()).collect::<Vec<_>>(),
+        );
+    }
+
+    // ── Denomination-1 mixing ───────────────────────────────────────────
+
+    #[test]
+    fn denomination_1_mix_needs_denomination_1_fee() {
+        // Edge case: mixing denomination 1 coins.
+        //
+        // This test used to assert that the donor was ALSO denomination 1, so it
+        // was indistinguishable from a mixer and the privacy set was N+1. The
+        // size-derived fee ended that: a 2-way mix costs 27, so a denomination-1
+        // mix now carries a donor 27x the size of every mixer. The donor is
+        // trivially identifiable, and with it the mix itself.
+        //
+        // That is a real privacy regression for small denominations, not a
+        // test-only concern — see the note on `recommended_fee_for_mix`.
+        let mut session = MixSession::with_salt(1, 2, [0; 32]).unwrap();
+
+        for i in 0..2u8 {
+            let seed = hash(&[i]);
+            let pk = wots::keygen(&seed);
+            let input = InputReveal { predicate: Predicate::p2pk(&pk), value: 1, salt: [i + 10; 32] , commitment: None };
+            let output = OutputData::Standard { address: hash(&[i + 20]), value: 1, salt: [i + 30; 32] };
+            session.register(input, output).unwrap();
+        }
+
+        let required = recommended_fee_for_mix(2);
+        let (_, fee) = make_fee_participant(b"fee-d1", required);
+        session.set_fee_input(fee).unwrap();
+
+        let p = session.proposal().unwrap();
+        // 2 mixers at denom 1, plus a donor that no longer resembles them.
+        assert_eq!(p.inputs.iter().filter(|i| i.value == 1).count(), 2);
+        assert_eq!(p.inputs.len(), 3);
+        assert_eq!(p.outputs.len(), 2);
+        assert_eq!(p.inputs.last().unwrap().value, recommended_fee_for_mix(2));
+        assert!(
+            p.inputs.last().unwrap().value > 1,
+            "donor is distinguishable from mixers at this denomination"
+        );
+
+        let in_sum: u64 = p.inputs.iter().map(|i| i.value).sum();
+        let out_sum: u64 = p.outputs.iter().map(|o| o.value()).sum();
+        assert_eq!(in_sum - out_sum, recommended_fee_for_mix(2));
+    }
+
+    // ── Accessor coverage ───────────────────────────────────────────────
+
+    #[test]
+    fn accessors() {
+        let s = MixSession::new(16, 3).unwrap();
+        assert_eq!(s.denomination(), 16);
+        assert_eq!(s.participant_count(), 0);
+        assert!(!s.has_fee_input());
+        assert!(!s.is_ready());
+    }
+}

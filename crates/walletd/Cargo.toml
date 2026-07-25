@@ -1,0 +1,26 @@
+[package]
+name = "mirstat-walletd"
+version = "0.1.0"
+edition = "2021"
+description = "Headless wallet service for the mirstat desktop app: owns the wallet file, embeds the full node, and drives the commit→reveal state machines."
+
+[dependencies]
+mirstat = { path = "../.." }
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+bip32 = "0.5"
+bip39 = "2.0"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+rand = "0.8"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+dirs = "5.0"
+libp2p = { version = "0.56", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.8"

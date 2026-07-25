@@ -1,0 +1,87 @@
+[package]
+name = "mirstat"
+version = "4.0.0"
+edition = "2021"
+
+[dependencies]
+# PURE RUST / WASM-SAFE: Cryptography, Math, Data Structures, Serialization
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+anyhow = "1.0"
+thiserror = "1.0"
+rand = "0.8"
+hex = "0.4"
+aes-gcm = "0.10"
+rand_chacha = "0.3"
+blake3 = "1.5"
+argon2 = "0.5"
+rayon = "1.8"
+futures = "0.3"
+async-trait = "0.1"
+primitive-types = "0.14"
+im = { version = "15.1", features = ["serde"] }
+bip39 = "2.0"
+toml = "1.0.3"
+tracing = "0.1"
+smallvec = "1.15.1"
+lazy_static = "1"
+
+# NATIVE ONLY: Networking, File System, OS Allocators, CLI, Web Servers
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.35", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+redb = "2.0"
+axum = "0.7"
+tower-http = { version = "0.5.2", features = ["trace", "cors", "timeout"] }
+rpassword = "7.3"
+dirs = "5.0"
+wgpu = "29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+
+libp2p = { version = "0.56", features = ["tokio", "noise", "tcp", "yamux", "kad", "identify", "request-response", "macros", "quic", "relay", "dcutr", "autonat"] }
+libp2p-stream = "0.4.0-alpha"          # ← updated for libp2p 0.56
+libp2p-webrtc = { version = "0.9.0-alpha.1", features = ["tokio"] }
+libp2p-core = "0.43"                   # ← required for Transport trait + StreamMuxerBox
+
+# reqwest: use rustls instead of native openssl — pure Rust, cross-compiles cleanly
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# Use jemalloc on Linux/macOS (Not Wasm, Not Windows)
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_env = "msvc")))'.dependencies]
+tikv-jemallocator = "0.5.4"
+
+# Use mimalloc on Windows (Not Wasm, Windows MSVC)
+[target.'cfg(all(not(target_arch = "wasm32"), target_env = "msvc"))'.dependencies]
+mimalloc = "0.1.43"
+
+
+[features]
+fast-mining = []
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+
+[workspace]
+members = [
+    "crates/walletd",
+    "apps/desktop",
+]
+exclude = [
+    "apps/desktop-webview",
+    "wasm-wallet",
+    "sdk",
+    "mirstat_relayer_daemon",
+    "buildroot",
+]

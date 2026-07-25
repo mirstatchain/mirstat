@@ -1,0 +1,38 @@
+{
+  "name": "mirstat-sdk",
+  "version": "1.0.8",
+  "description": "Official JavaScript SDK for the mirstat Blockchain",
+  "main": "src/index.js",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js",
+    "./pkg/*": "./pkg/*"
+  },
+  "files": [
+    "pkg",
+    "src"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "mirstat",
+    "crypto",
+    "blockchain",
+    "post-quantum"
+  ],
+  "author": "",
+  "license": "GPL",
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@libp2p/identify": "^4.1.6",
+    "@libp2p/ping": "^3.1.5",
+    "@libp2p/tcp": "^11.0.20",
+    "@libp2p/utils": "^7.2.1",
+    "@libp2p/webrtc": "^6.0.23",
+    "@multiformats/multiaddr": "^13.0.3",
+    "it-pipe": "^3.0.1",
+    "libp2p": "^3.3.2"
+  }
+}

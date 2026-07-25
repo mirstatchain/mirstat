@@ -1,0 +1,3104 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mirstat | Protocol Architecture</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/* ── Minimalist Theme Variables (Ink on Paper) ───────────────────────────── */
+:root[data-theme="light"] {
+    --bg: #ffffff;
+    --bg-alt: #ffffff;
+    --border: #e3e3e3;
+    --border-bright: #cfcfcf;
+    --text-max: #111111;
+    --text-main: #111111;
+    --text-bright: #383838;
+    --text-muted: #565656;
+    --text-faint: #a2a2a2;
+    --code-bg: #f4f4f4;
+    --accent: #111111;
+    --highlight: #efefef;
+    --terminal-bg: #f4f4f4;
+    --terminal-text: #111111;
+    --stark-accent: #111111;
+    --stark-bg: #efefef;
+    --warn-accent: #565656;
+    --warn-bg: #efefef;
+    --link-color: #111111;
+    
+    --radius: 0;
+    --shadow: none;
+}
+
+:root[data-theme="dark"] {
+    --bg: #0a0a0a;
+    --bg-alt: #141414;
+    --border: #262626;
+    --border-bright: #363636;
+    --text-max: #f5f5f5;
+    --text-main: #f5f5f5;
+    --text-bright: #cfcfcf;
+    --text-muted: #9a9a9a;
+    --text-faint: #5a5a5a;
+    --code-bg: #181818;
+    --accent: #f5f5f5;
+    --highlight: #1f1f1f;
+    --terminal-bg: #0a0a0a;
+    --terminal-text: #f5f5f5;
+    --stark-accent: #f5f5f5;
+    --stark-bg: #1f1f1f;
+    --warn-accent: #9a9a9a;
+    --warn-bg: #1f1f1f;
+    --link-color: #f5f5f5;
+
+    --radius: 0;
+    --shadow: none;
+}
+
+/* Dogmatic guards: zero radius / shadow / motion everywhere */
+*, *::before, *::after { 
+    box-sizing: border-box; 
+    border-radius: 0 !important; 
+    box-shadow: none !important; 
+    text-shadow: none !important; 
+    animation: none !important; 
+    transition: none !important; 
+}
+* { margin: 0; padding: 0; }
+
+body {
+    background-color: var(--bg);
+    color: var(--text-main);
+    font-family: 'Inter', -apple-system, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--link-color); text-decoration: underline; text-underline-offset: 4px; }
+a:hover { color: var(--text-max); text-decoration-style: solid; }
+h1, h2, h3, h4, .mono { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+
+/* ── Top Navigation ─────────────────────────────────────────────────────── */
+
+.topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 32px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+.brand {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 16px;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--text-max);
+}
+.brand-mid {
+    color: var(--text-muted); /* This is your existing grey variable */
+}
+
+.brand-state {
+    color: var(--text-max); /* This is your existing black (light mode) / white (dark mode) variable */
+}
+.brand-indicator {
+    width: 8px;
+    height: 8px;
+    background-color: var(--text-max);
+    border: 1px solid var(--border-bright);
+}
+
+.nav-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
+.btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    font-family: 'Inter', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 6px 12px;
+    cursor: pointer;
+    text-decoration: none !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.btn:hover {
+    background: var(--bg-alt);
+    border-color: var(--text-max);
+}
+
+/* Theme Toggle Icons */
+#theme-btn { padding: 6px 10px; background: transparent; border: 1px solid var(--border); cursor: pointer; color: var(--text-main); }
+#theme-btn:hover { background: var(--bg-alt); border-color: var(--text-max); }
+.sun-icon, .moon-icon { width: 16px; height: 16px; fill: currentColor; }
+:root[data-theme="light"] .sun-icon { display: none; }
+:root[data-theme="dark"] .moon-icon { display: none; }
+
+.brand-logo {
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
+    /* Smooth scaling */
+    image-rendering: high-quality; 
+}
+
+/* Dark Theme: Green becomes White, Black stays Black */
+:root[data-theme="dark"] .brand-logo {
+    filter: grayscale(100%) brightness(500%);
+}
+
+/* Light Theme: Black becomes White, Green becomes Black */
+:root[data-theme="light"] .brand-logo {
+    filter: grayscale(100%) brightness(500%) invert(100%);
+}
+
+/* ── Main Layout ───────────────────────────────────────────────────────── */
+.workspace {
+    display: flex;
+    flex: 1;
+    max-width: 1200px;
+    margin: 40px auto;
+    width: 100%;
+}
+
+.sidebar {
+    width: 240px;
+    padding-right: 40px;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    position: sticky;
+    top: 100px;
+    align-self: flex-start;
+}
+
+.menu-item {
+    padding: 10px 14px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-left: 3px solid transparent;
+}
+
+.menu-item:hover { color: var(--text-main); background: var(--bg-alt); border-color: var(--border); }
+.menu-item.active {
+    color: var(--text-max);
+    font-weight: 600;
+    background: var(--bg-alt);
+    border-left: 3px solid var(--text-max);
+}
+
+/* ── Output / Content Area ─────────────────────────────────────────────── */
+.output-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding-bottom: 100px;
+}
+
+.content-pane { display: none; }
+.content-pane.active { display: block; }
+
+h2 { font-size: 28px; margin-bottom: 24px; letter-spacing: -0.5px; border-bottom: 2px solid var(--border); padding-bottom: 12px; color: var(--text-max); }
+h3 { font-size: 20px; margin-top: 48px; margin-bottom: 16px; letter-spacing: -0.3px; color: var(--text-max); }
+h4 { font-size: 15px; margin-top: 24px; margin-bottom: 12px; font-weight: 600; color: var(--text-main); text-transform: uppercase; letter-spacing: 1px; }
+
+p { margin-bottom: 18px; color: var(--text-muted); }
+ul { padding-left: 20px; margin-bottom: 24px; color: var(--text-muted); }
+li { margin-bottom: 10px; }
+strong { color: var(--text-max); font-weight: 600; }
+
+code {
+    background: var(--code-bg);
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85em;
+    color: var(--text-main);
+}
+
+pre {
+    background: var(--bg-alt);
+    padding: 16px;
+    border: 1px solid var(--border);
+    overflow-x: auto;
+    margin-bottom: 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+/* ── Deep Dive Accordions ──────────────────────────────────────────────── */
+details.deep-dive {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    margin: 24px 0;
+}
+
+details.deep-dive summary {
+    padding: 14px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    list-style: none;
+    color: var(--text-max);
+    background: var(--bg-alt);
+    display: flex;
+    align-items: center;
+    font-family: 'JetBrains Mono', monospace;
+    border-bottom: 1px solid transparent;
+}
+
+details.deep-dive summary::-webkit-details-marker { display: none; }
+details.deep-dive summary::before { 
+    content: '[+] '; 
+    display: inline-block; 
+    width: 30px; 
+    color: var(--text-muted);
+}
+details.deep-dive[open] summary::before { content: '[-] '; color: var(--text-max); }
+details.deep-dive[open] summary { border-bottom: 1px solid var(--border); }
+details.deep-dive summary:hover { background: var(--code-bg); }
+
+.dd-content {
+    padding: 20px;
+    font-size: 14px;
+}
+.dd-content p:last-child { margin-bottom: 0; }
+
+/* ── Stats Grid ────────────────────────────────────────────────────────── */
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+}
+
+.stat-card {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    padding: 20px;
+}
+
+.stat-label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 24px;
+    color: var(--text-max);
+}
+
+/* ── Interactive Tabs ──────────────────────────────────────────────────── */
+.tabs {
+    margin: 24px 0;
+    border: 1px solid var(--border);
+}
+
+.tab-nav {
+    display: flex;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    flex: 1;
+    text-align: center;
+    padding: 14px 12px;
+    border: none;
+    border-right: 1px solid var(--border);
+    background: transparent;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.tab-btn:hover { color: var(--text-max); background: var(--bg); }
+.tab-btn:last-child { border-right: none; }
+.tab-btn.active {
+    background: var(--bg);
+    color: var(--text-max);
+    border-bottom: 2px solid var(--text-max);
+}
+
+.tab-content {
+    padding: 24px;
+    display: none;
+    background: var(--bg);
+}
+.tab-content.active { display: block; }
+
+/* ── Callout Boxes ─────────────────────────────────────────────────────── */
+.callout {
+    padding: 20px;
+    border-left: 4px solid var(--border);
+    background: var(--bg-alt);
+    margin-bottom: 24px;
+}
+.callout.stark { border-left-color: var(--text-max); background: var(--highlight); }
+.callout.warn { border-left-color: var(--text-muted); background: var(--bg-alt); }
+
+.callout h4 { margin-top: 0; margin-bottom: 12px; font-size: 16px; color: var(--text-max); }
+.callout p { margin-bottom: 12px; font-size: 14px; color: var(--text-muted); }
+.callout p:last-child { margin-bottom: 0; }
+.callout code { background: var(--bg); border: 1px solid var(--border); }
+
+/* ── Terminal Simulation ───────────────────────────────────────────────── */
+.terminal {
+    background: var(--terminal-bg);
+    border: 1px solid var(--border);
+    padding: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-muted);
+    margin: 24px 0;
+    overflow-x: auto;
+}
+
+.term-line { margin-bottom: 6px; display: flex; gap: 16px; }
+.term-time { color: var(--text-faint); min-width: 90px;}
+.term-info { color: var(--text-muted); min-width: 45px; font-weight: bold;}
+.term-success { color: var(--text-max); }
+.term-warn { color: var(--text-muted); }
+
+/* ── Flow Diagrams ─────────────────────────────────────────────────────── */
+.flow-diagram {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 24px 0;
+    padding: 24px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    overflow-x: auto;
+}
+
+.flow-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    padding: 14px 20px;
+    font-size: 13px;
+    color: var(--text-max);
+    white-space: nowrap;
+    font-family: 'JetBrains Mono', monospace;
+    text-align: center;
+}
+.flow-box.stark { border-color: var(--text-max); border-width: 2px; }
+
+.flow-arrow {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: bold;
+}
+
+/* ── Math Blocks ───────────────────────────────────────────────────────── */
+.math-block {
+    background: var(--bg-alt);
+    padding: 20px;
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    margin-bottom: 24px;
+    color: var(--text-max);
+    overflow-x: auto;
+    border-left: 3px solid var(--text-muted);
+}
+
+/* ── Comparison Table ──────────────────────────────────────────────────── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 24px;
+    font-size: 14px;
+    border: 1px solid var(--border);
+}
+
+th, td {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+}
+
+th { background: var(--bg-alt); color: var(--text-max); font-weight: 600; font-family: 'JetBrains Mono', monospace;}
+td { color: var(--text-muted); background: var(--bg); }
+td.hl { color: var(--text-max); font-weight: 600; background: var(--highlight); }
+
+.mobile-nav-header, .mobile-external-links { display: none; }
+
+@media (max-width: 900px) {
+    .desktop-links { display: none !important; }
+    #mobile-menu-btn { display: inline-flex !important; padding: 6px 10px; }
+
+    .topbar { padding: 16px 20px; }
+    .workspace { flex-direction: column; padding: 0 20px; margin: 20px auto; }
+    
+    .sidebar {
+        position: fixed;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: var(--bg);
+        z-index: 9999;
+        padding: 24px;
+        flex-direction: column;
+        transform: translateX(-100%);
+        transition: transform 0.3s ease !important; /* Overrides the dogmatic rule */
+        overflow-y: auto;
+        margin-bottom: 0;
+        border-bottom: none;
+    }
+    .sidebar.open {
+        transform: translateX(0);
+    }
+    
+    .mobile-nav-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid var(--border);
+    }
+    .mobile-external-links {
+        display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px;
+    }
+    .mobile-external-links .btn { flex: 1 1 45%; justify-content: center; }
+
+    .menu-item { 
+        border-left: 3px solid transparent; 
+        border-bottom: none; 
+        text-align: left; 
+        justify-content: space-between; 
+        padding: 14px 16px;
+    }
+    .menu-item.active { border-bottom-color: transparent; }
+    .menu-item span { display: inline; }
+
+    .flow-diagram { flex-direction: column; align-items: flex-start; }
+    .flow-arrow { transform: rotate(90deg); margin-left: 20px; }
+    .tab-btn { border-right: none; border-bottom: 1px solid var(--border); width: 100%; text-align: left;}
+}
+
+/* ── Roadmap Ledger ────────────────────────────────────────────────────── */
+/* Monochrome by design: status is carried by rule weight and a monospace
+   token, never by colour. Shipped rows are deliberately the heaviest thing
+   on the page — most of this list is already built, and the weight should
+   say so. */
+
+.rm-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    margin: 24px 0 36px;
+    padding: 14px 20px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.rm-legend > span { display: flex; align-items: center; gap: 9px; }
+.rm-key { width: 10px; height: 10px; flex: none; border: 1px solid var(--text-faint); }
+.rm-key.done { background: var(--text-max); border-color: var(--text-max); }
+.rm-key.wip  { background: var(--text-muted); border-color: var(--text-muted); }
+.rm-key.next { background: transparent; border-style: dashed; }
+
+.rm-group { margin: 0 0 28px; border: 1px solid var(--border); }
+.rm-group > h4 {
+    margin: 0;
+    padding: 14px 20px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 1px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+}
+.rm-tally {
+    color: var(--text-faint);
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.rm-item {
+    display: flex;
+    gap: 18px;
+    align-items: baseline;
+    padding: 15px 20px;
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid transparent;
+}
+.rm-item:last-child { border-bottom: none; }
+.rm-item.done { border-left-color: var(--text-max); }
+.rm-item.wip  { border-left-color: var(--text-muted); background: var(--highlight); }
+.rm-item.next { border-left: 3px dashed var(--border); }
+
+.rm-status {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    min-width: 88px;
+    flex: none;
+    letter-spacing: 0.5px;
+}
+.rm-item.done .rm-status { color: var(--text-max); }
+.rm-item.wip  .rm-status { color: var(--text-main); }
+.rm-item.next .rm-status { color: var(--text-faint); }
+
+.rm-body { min-width: 0; }
+.rm-title {
+    display: block;
+    color: var(--text-max);
+    font-weight: 500;
+    font-size: 15px;
+    margin-bottom: 4px;
+}
+.rm-item.next .rm-title { color: var(--text-bright); font-weight: 400; }
+.rm-note { color: var(--text-muted); font-size: 13.5px; line-height: 1.55; }
+.rm-note code { font-size: 0.82em; }
+
+@media (max-width: 640px) {
+    .rm-item { flex-direction: column; gap: 7px; }
+    .rm-status { min-width: 0; }
+    .rm-group > h4 { flex-direction: column; gap: 4px; }
+}
+/* ── Boot Sequence Curtain ──────────────────────────────────────────────── */
+#curtain {
+    position: fixed; inset: 0; z-index: 99999;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    opacity: 1;
+    transition: opacity 420ms ease-out !important;
+    cursor: pointer;
+}
+#curtain.lifting { opacity: 0; pointer-events: none; }
+#curtain.gone { display: none; }
+
+#curtain .stage {
+    position: relative;
+    width: 100%; max-width: 640px;
+    padding: 0 24px;
+    display: flex; flex-direction: column; align-items: center;
+}
+
+#curtain .act {
+    position: absolute; left: 0; right: 0;
+    display: flex; flex-direction: column; align-items: center;
+    opacity: 0;
+    transition: opacity 220ms ease !important;
+    padding: 0 24px;
+}
+#curtain .act.on { opacity: 1; }
+
+#curtain .grid {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-variant-ligatures: none;
+    font-size: clamp(9.5px, 2.05vw, 13px);
+    line-height: 1.75;
+    letter-spacing: 0.04em;
+    white-space: pre;
+    color: var(--text-max);
+    text-align: center;
+    transition: line-height 260ms ease !important;
+}
+#curtain .grid.crushed { line-height: 0.35; }
+#curtain .grid .row { transition: opacity 240ms ease !important; }
+#curtain .grid .faint { color: var(--text-faint); }
+
+#curtain .rule {
+    margin: 18px 0 14px;
+    height: 1px; background: var(--border-bright);
+    width: 0; max-width: 100%;
+    transition: width 500ms cubic-bezier(.22,.61,.36,1) !important;
+}
+#curtain .act.on .rule { width: 340px; }
+
+#curtain .caption {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 9px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--text-faint); text-align: center;
+    min-height: 12px;
+}
+
+#curtain .logo-slot { height: 52px; margin-bottom: 20px; display: flex; align-items: center; }
+
+#curtain .grid.resolving { font-weight: 600; color: var(--text-max); }
+#curtain .grid .mid { color: var(--text-muted); }
+
+#boot-logo { width: 52px; height: 52px; object-fit: contain; opacity: 0; transition: opacity 400ms ease !important; }
+#boot-logo.on { opacity: 1; }
+:root[data-theme="dark"] #boot-logo { filter: grayscale(100%) brightness(500%); }
+:root[data-theme="light"] #boot-logo { filter: grayscale(100%) brightness(500%) invert(100%); }
+
+#curtain .skip {
+    position: fixed; bottom: 26px; left: 0; right: 0; text-align: center;
+    font-size: 9px; letter-spacing: 0.28em; text-transform: uppercase;
+    color: var(--text-faint); opacity: 0;
+    transition: opacity 400ms ease !important;
+    pointer-events: none;
+}
+#curtain .skip.on { opacity: 0.5; }
+
+@media (prefers-reduced-motion: reduce) {
+    #curtain { display: none !important; }
+}
+</style>
+</head>
+<body>
+<!-- Boot Sequence Curtain -->
+<div id="curtain">
+    <div class="stage">
+        <!-- Act 1 — the anchor -->
+        <div class="act" id="act1">
+            <div class="logo-slot"></div>
+            <div class="grid" id="btcHash"></div>
+            <div class="rule"></div>
+            <div class="caption">Bitcoin · Block 938708 · 24 Feb 2026</div>
+        </div>
+
+        <!-- Acts 2 + 3 share one element, so the inscription visibly becomes the hash -->
+        <div class="act" id="act23">
+            <div class="logo-slot"><img id="boot-logo" src="logo.svg" alt="" onerror="this.style.display='none'"></div>
+            <div class="grid" id="block"></div>
+            <div class="rule"></div>
+            <div class="caption" id="cap23"></div>
+        </div>
+    </div>
+    <div class="skip" id="skip">Click to skip</div>
+</div>
+
+<!--instantly hide the curtain for returning users -->
+<script>
+    if (sessionStorage.getItem('mirstat-intro-played')) {
+        document.getElementById('curtain').style.display = 'none';
+    }
+</script>
+
+<div class="topbar">
+    <div class="brand">
+        <img src="logo.svg" alt="mirstat" class="brand-logo"> 
+        <span><span class="brand-mid">MID</span><span class="brand-state">STATE</span></span>
+    </div>
+
+    <div class="nav-actions">
+        <!-- Desktop Links Wrapper -->
+        <div class="desktop-links" style="display: flex; gap: 12px; align-items: center;">
+            <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
+            <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
+            <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
+            <a href="https://github.com/mirstatchain/mirstat/blob/main/whypaper.md" target="_blank" class="btn">Whypaper</a>
+            <a href="https://github.com/mirstatchain/mirstat" target="_blank" class="btn">GitHub</a>
+        </div>
+        
+        <button id="theme-btn" aria-label="Toggle Theme">
+            <svg class="sun-icon" viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.758 17.303a.75.75 0 00-1.061-1.06l-1.591 1.59a.75.75 0 001.06 1.061l1.591-1.59zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.697 7.757a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 00-1.061 1.06l1.59 1.591z" /></svg>
+            <svg class="moon-icon" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clip-rule="evenodd" /></svg>
+        </button>
+
+        <!-- Mobile Hamburger Button -->
+        <button id="mobile-menu-btn" class="btn" aria-label="Menu" style="display: none;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+        </button>
+    </div>
+</div>
+
+<div class="workspace">
+    <div class="sidebar" id="sidebar-menu">
+        <!-- Mobile Menu Header & External Links -->
+        <div class="mobile-nav-header">
+            <span style="font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text-max);">NAVIGATION</span>
+            <button id="mobile-close-btn" class="btn" style="padding: 4px 8px;">✕</button>
+        </div>
+        <div class="mobile-external-links">
+            <a href="./wallet/" target="_blank" class="btn">Web Wallet</a>
+            <a href="./ide.html" target="_blank" class="btn">Midscript IDE</a>
+            <a href="https://rpc.cypherpunk.gold" target="_blank" class="btn">Explorer</a>
+            <a href="https://github.com/mirstatchain/mirstat" target="_blank" class="btn">GitHub</a>
+        </div>
+
+        <div class="menu-item active" data-target="overview">Overview <span>→</span></div>
+        <div class="menu-item" data-target="get-started">Get Started <span>→</span></div>
+        <div class="menu-item" data-target="roadmap">Roadmap <span>→</span></div>
+        <div class="menu-item" data-target="genesis">Genesis & Fair Launch <span>→</span></div>
+        <div class="menu-item" data-target="crypto">Cryptography <span>→</span></div>
+        <div class="menu-item" data-target="consensus">Mining & Consensus <span>→</span></div>
+        <div class="menu-item" data-target="economics">Economics & Supply <span>→</span></div>
+        <div class="menu-item" data-target="privacy">Privacy & Fungibility <span>→</span></div>
+        <div class="menu-item" data-target="state">State Mgmt & Sync <span>→</span></div>
+        <div class="menu-item" data-target="vm">Virtual Machine <span>→</span></div>
+        <div class="menu-item" data-target="axe-hw">mirstatAxe Hardware <span>→</span></div>
+        <div class="menu-item" data-target="adversarial">Adversarial Analysis <span>→</span></div>
+        <div class="menu-item" data-target="vs-legacy">Architecture Comp. <span>→</span></div>
+    </div>
+
+    <div class="output-area">
+
+        <!-- ── OVERVIEW ── -->
+        <div class="content-pane active" id="overview">
+            <h2>System Overview</h2>
+            <p>mirstat is a peer-to-peer electronic cash system engineered from the ground up for constrained edge environments (specifically Cortex-A53/A72/A76 architectures). It entirely abandons elliptic curve mathematics in favor of post-quantum hash functions.</p>
+            
+            <p>By enforcing sequential CPU mining, forcing all UTXOs into uniform power-of-2 denominations, it creates a robust, relatively private financial network that cannot be dominated by parallel ASICs or dismantled by blockchain surveillance firms.</p>
+
+            <div class="callout">
+                <h4>Why the name "mirstat"?</h4>
+                <p>In traditional blockchains, blocks are distinct data structures linked by their header hashes. mirstat elevates this by maintaining a continuous, mathematically chained <strong>BLAKE3 mirstat</strong> for transactions, while binding it to the chain using sequential header hashing.</p>
+                
+                <div class="math-block">
+                    H_0 = Header Hash N-1<br>
+                    H_1 = BLAKE3_1M_Iters(H_0 || mirstat || State Root || Nonce)<br>
+                    H_2 = BLAKE3_1M_Iters(H_1 || mirstat || State Root || Nonce)
+                </div>
+
+                <p>The <code>mirstat</code> tracks the continuous mathematical state of the UTXO set. When a miner processes a block, they construct a <strong>Block Header</strong> (containing the new mirstat, the state root, and the previous header hash), and subject it to exactly 1,000,000 sequential BLAKE3 compression cycles. Every transaction permanently mutates this internal state, securely anchoring the ledger to a sequential proof of time.</p>
+            </div>
+
+            <h3>How is mirstat Different?</h3>
+            <ul>
+                <li><strong>No Elliptic Curves (Post-Quantum):</strong> It uses zero ECC math (no secp256k1). Every signature, commitment, and script relies solely on the BLAKE3 hash function, immunizing the network against Shor's algorithm.</li>
+                <li><strong>Sequential vs. Parallel Mining:</strong> Typical PoW allows ASICs to run trillions of hashes in parallel. mirstat forces miners to compute hashes in a strict, unrollable sequence, shifting the bottleneck from parallel throughput to single-thread latency.</li>
+                <li><strong>Power-of-2 UTXOs:</strong> Standard UTXOs use exact amounts, creating unique cryptographic fingerprints. mirstat forces all coins into identical power-of-2 denominations, fracturing surveillance graphs.</li>
+                <li><strong>Commit-Reveal Mempool:</strong> Standard mempools broadcast cleartext trades. mirstat blinds transactions in the mempool until a miner cryptographically commits to processing them.</li>
+                <li><strong>Bounded State (Sparse Merkle Trees):</strong> Instead of an infinitely growing LevelDB database, mirstat accumulates UTXOs into a rolling Sparse Merkle Tree, heavily capping the RAM required to run a full node.</li>
+                <li><strong>Decentralized-Auditable Pools:</strong> mirstat implements a native Stratum pool design where miners independently audit Merkle Precommitments. Block templates pay miners <em>directly</em> on-chain proportional to their verified score, avoiding pool custody entirely.</li>
+            </ul>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Core Hash Primitive</div>
+                    <div class="stat-value">BLAKE3</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Block Time & Diff</div>
+                    <div class="stat-value">60s / ASERT</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">UTXO Model</div>
+                    <div class="stat-value">Powers of 2 Only</div>
+                </div>
+            </div>
+
+            <div class="terminal">
+                <div class="term-line"><span class="term-time">22:49:44.101</span> <span class="term-info">INFO</span> <span>Loaded state: height=29000 depth=14859300 coins=4582 commitments=12</span></div>
+                <div class="term-line"><span class="term-time">22:49:44.150</span> <span class="term-info">INFO</span> <span>Node started (mining: true, threads: 4, rpc: 8545)</span></div>
+                <div class="term-line"><span class="term-time">22:49:44.152</span> <span class="term-info">INFO</span> <span>Mining SIMD: NEON 4-way (4 nonces/batch)</span></div>
+                <div class="term-line"><span class="term-time">22:50:11.883</span> <span class="term-success">INFO</span> <span class="term-success">Mined batch! height=29001 outputs=2 target=000ffff...</span></div>
+            </div>
+        </div>
+
+
+<!-- ── GET STARTED ── -->
+        <div class="content-pane" id="get-started">
+            <h2>Get Started</h2>
+            <p>mirstat is a live, functional network. The chain is producing blocks, people are mining on commodity hardware, and the coin is actively trading. Choose how you want to interact with the ecosystem below.</p>
+
+            <div class="stat-grid" style="margin-top: 32px;">
+                <!-- Trade Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Acquire MDS</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">SafeTrade</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">MDS is actively traded against USDT on the SafeTrade exchange.</p>
+                    <a href="https://safetrade.com/exchange/MDS-USDT?type=basic" target="_blank" class="btn">Go to Exchange ↗</a>
+                </div>
+
+                <!-- Download Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Run a Node</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Desktop Wallet</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Get the full GUI wallet or CLI binaries for Windows, Mac, and Linux.</p>
+                    <a href="https://github.com/mirstatchain/mirstat/releases" target="_blank" class="btn">GitHub Releases ↗</a>
+                </div>
+                
+                <!-- Discord Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Community</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">Discord Server</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Chat with other miners, developers, and users building the network.</p>
+                    <a href="https://discord.gg/mirstat" target="_blank" class="btn">Join Discord ↗</a>
+                </div>
+
+                <!-- Twitter Card -->
+                <div class="stat-card">
+                    <div class="stat-label">Updates</div>
+                    <div class="stat-value" style="font-size: 18px; margin-bottom: 12px;">X</div>
+                    <p style="font-size: 13.5px; margin-bottom: 20px;">Follow the lead developer for protocol upgrades and network news.</p>
+                    <a href="https://x.com/mirstat_dev" target="_blank" class="btn">@mirstat_dev ↗</a>
+                </div>
+            </div>
+            
+            <div class="callout stark">
+                <h4>Want a wallet in 30 seconds?</h4>
+                <p>If you don't want to download the full desktop node just yet, you can use the <a href="./wallet/" target="_blank">mirstat Web Wallet</a>. It runs entirely in your browser, connects directly to peers via WebRTC, and can even solo-mine using your CPU's WASM worker threads. Just remember to not use the SAME web wallet on different devices and run "rescan" regularly!</p>
+            </div>
+        </div>
+
+        <!-- ── CRYPTOGRAPHY ── -->
+        <div class="content-pane" id="crypto">
+            <h2>Post-Quantum Cryptography</h2>
+            <p>Elliptic Curve Cryptography (secp256k1) is vulnerable to Shor's algorithm via quantum computers. mirstat uses exactly zero elliptic curve mathematics, relying strictly on the <code>BLAKE3</code> hash function for all cryptographic signatures, commitments, and proofs.</p>
+            
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="wots">WOTS+ (One-Time Keys)</button>
+                    <button class="tab-btn" data-tab="mss">MSS (Reusable Keys)</button>
+                    <button class="tab-btn" data-tab="simd">SIMD Ghost Hashing</button>
+                </div>
+                
+                <div class="tab-content active" id="wots">
+                    <h3>Winternitz One-Time Signatures (WOTS+)</h3>
+                    <p>Standard receiving keys and change outputs use WOTS+. Because hash-based signatures reveal parts of the private key during use, WOTS keys must <strong>never sign more than once</strong>.</p>
+                    
+                    <p>To prevent accidental key reuse across sibling UTXOs (coins sent to the same address), mirstat enforces a strict "co-spend grouping" rule in the wallet. If a user attempts to spend one coin, the wallet will autonomously pull in all sibling coins at that address. Spending them in the exact same transaction produces an identical commitment hash, meaning the WOTS signature is identical, resulting in zero additional key leakage.</p>
+
+                    <details class="deep-dive">
+                        <summary>The Mathematics of w=16</summary>
+                        <div class="dd-content">
+                            <p>Most WOTS implementations use <code>w=8</code> (8 bits per digit), which creates 32 message chains of max depth 255. mirstat uses an extreme parameter of <code>w=16</code>.</p>
+                            <div class="math-block">
+                                Message Chains: 256 bits / 16 = 16 chains<br>
+                                Checksum Chains: Σ(65535 - d_i) fits in 20 bits → 2 chains<br>
+                                Total Chains: 18<br>
+                                Max Chain Depth: 65,535 hashes
+                            </div>
+                            <p><strong>The Tradeoff:</strong> By using <code>w=16</code>, the signature size shrinks from ~1,088 bytes down to exactly <strong>576 bytes</strong> (18 chains × 32 bytes). The cost is CPU computation: signing or verifying requires up to 65,535 hashes per chain. This is solved via SIMD acceleration.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-content" id="mss">
+                    <h3>Merkle Signature Scheme (MSS)</h3>
+                    <p>If a user requires a static, reusable address (e.g., for a donation page or a mining pool payout), mirstat wraps thousands of WOTS keys into an MSS binary tree. The Master Public Key is the root of the Merkle tree.</p>
+                    
+                    <p>Generating a default height-10 tree (1,024 signatures) locally takes ~1-2 seconds on modern CPUs. The signature size increases logarithmically: a 576-byte WOTS payload + (Height × 33 bytes for the authentication path).</p>
+
+                    <details class="deep-dive">
+                        <summary>The Replay Defense (Spent Oracle)</summary>
+                        <div class="dd-content">
+                            <p>To prevent replay attacks during chain reorgs, the consensus engine maintains a <code>spent_addresses</code> database table.</p>
+                            <p>For standard WOTS, the address hash is burned. For MSS, burning the address would destroy the entire tree. Instead, the protocol dynamically extracts the <strong>specific leaf's WOTS public key</strong> from the MSS signature and burns that specific nullifier. If the exact same transaction is replayed during a reorg, the commitment hashes match and it is accepted. If a <em>different</em> transaction attempts to reuse that leaf, it is rejected by consensus.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-content" id="simd">
+                    <h3>The SIMD Masking Trick</h3>
+                    <p>With <code>w=16</code>, WOTS chain iterations vary wildly. Chain 0 might need 5 hashes, while Chain 1 needs 60,000 hashes. Standard scalar execution handles these one by one.</p>
+                    
+                    <p>mirstat accelerates this using hand-rolled hardware SIMD registers (AVX2 256-bit on x86, NEON 128-bit on ARM). But because SIMD lanes execute in strict lockstep, how do you handle varying lengths without breaking the pipeline?</p>
+
+                    <div class="callout stark">
+                        <h4>Ghost Hashing & Batch Sorting</h4>
+                        <p>Before executing, the node sorts the required WOTS chains by depth (descending). It packs them into batches (e.g., 8 chains per AVX2 register). The SIMD loop then runs up to the maximum iterations required by the longest chain in that specific batch.</p>
+                        <p>As the loop progresses, a mask checks if the current step matches a specific lane's target depth. If it does, it extracts and saves that lane's 32-byte state. The lane then continues to compute garbage hashes ("ghost hashing") alongside its neighbors until the longest chain finishes.</p>
+                        <p>Even with millions of wasted "ghost" cycles, keeping the CPU pipeline saturated via branchless SIMD results in a <strong>10x faster signature generation</strong> on edge devices.</p>
+                    </div>
+
+                    <pre><code>// Example WGSL/SIMD extraction mask logic
+for step in 0..max_iters {
+    hw = compress_8way(&cv, &msg, 32);
+
+    // SIMD Masking Extraction: capture each lane's result the moment it
+    // reaches its target iteration, then let it ghost-hash freely.
+    for lane in 0..8 {
+        if iters[lane] > 0 && step == iters[lane] - 1 {
+            results[lane] = extract_hash(&hw, lane);
+        }
+    }
+}</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── CONSENSUS ── -->
+        <div class="content-pane" id="consensus">
+            <h2>Mining & Consensus</h2>
+            
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="seq-hash">Sequential Hashing</button>
+                    <button class="tab-btn" data-tab="hw-accel">Hardware Acceleration (SIMD & GPU)</button>
+                    <button class="tab-btn" data-tab="asert">ASERT Difficulty</button>
+                    <button class="tab-btn" data-tab="bayesian">Bayesian Finality</button>
+                    <button class="tab-btn" data-tab="pool-mining">Provably Fair Pools</button>
+                </div>
+
+                <div class="tab-content active" id="seq-hash">
+                    <h3>Neutralizing Parallel ASICs</h3>
+                    <p>Traditional Proof-of-Work (like SHA-256) operates in <code>O(1)</code> time and <code>O(N)</code> space. Finding a nonce is like buying lottery tickets: if you buy 100,000 tickets at once, you find the winner 100,000 times faster. ASICs achieve massive hashrates by stamping millions of parallel hash cores onto a single silicon die.</p>
+                    
+                    <p>mirstat inverts this model using <strong>Sequential Hashing</strong>. Finding a nonce is no longer a lottery; it is a marathon.</p>
+
+                    <p>To mine a block, a node must calculate 1,000,000 BLAKE3 hashes in a strict sequence: <code>H_n = BLAKE3(H_{n-1})</code>. Because the input of the next hash relies entirely on the output of the previous, the computation cannot be unrolled or divided across multiple cores.</p>
+                    
+                    <div class="callout stark">
+                        <h4>The Ratio of Power (ASIC Resistance Bound)</h4>
+                        <p>In Bitcoin, parallel hashrate is <em>H = C / L</em> (where <em>C</em> is cores, <em>L</em> is latency). ASICs win by scaling <em>C</em> to millions.</p>
+                        <p>In mirstat, a trial requires <em>S</em> sequential hashes. The time for one trial is <em>S × L_core</em>. An ASIC designer must optimize <em>L_core</em> (clock speed) because increasing parallel cores requires duplicating the entire 1,000,000-step state machine per core, demanding massive silicon area.</p>
+                        <p>Because silicon physics caps clock speeds around 4–5 GHz, an ASIC cannot physically be millions of times faster than a standard CPU. The advantage is strictly bounded by single-thread execution limits, creating a provable ~1000:1 hardware ceiling between a supercomputer and a Raspberry Pi.</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="hw-accel">
+                    <h3>Hardware Acceleration (SIMD & GPU)</h3>
+                    <p>While the sequential nature of the PoW chain prevents ASICs from collapsing the computation into a single cycle, nodes must still maximize hardware utilization to search multiple nonces concurrently. mirstat achieves this via bare-metal hardware integrations.</p>
+
+                    <h4>CPU SIMD: The Dual-Issue NEON Exploit</h4>
+                    <p>On x86_64 architectures, mirstat uses handwritten AVX2 intrinsics to process 8 nonces concurrently in 256-bit registers. However, ARM NEON registers are only 128-bit (4 lanes).</p>
+                    <p>Modern ARM out-of-order execution cores (like the Cortex-A76 in the Raspberry Pi 5, or Apple M-Series chips) feature <strong>two independent ASIMD pipelines</strong>. mirstat exploits this by manually interleaving two separate 4-way NEON streams in the assembly code. This intentionally exceeds the physical register count (32), forcing the compiler to spill to the L1 cache. The CPU then hides the L1 latency behind the dual-issued ALU work, resulting in nearly <strong>2.0x throughput</strong> compared to a standard 4-way implementation.</p>
+
+                    <h4>GPU Mining: Bypassing the Watchdog</h4>
+                    <p>GPUs are designed for massive parallelism, but sequential hashing (1,000,000 iterations) takes hundreds of milliseconds to complete a single chain. If a GPU compute shader runs for that long without yielding, the Operating System assumes the graphics driver has crashed and triggers a TDR (Timeout Detection and Recovery), killing the miner.</p>
+                    
+                    <div class="callout stark">
+                        <h4>The VRAM State Buffer Solution</h4>
+                        <p>mirstat's <code>WGSL</code> GPU miner solves this by breaking the 1,000,000-iteration chain into tiny micro-dispatches (e.g., 2,000 hashes at a time). Between each dispatch, the shader saves the exact 32-byte intermediate state of every single nonce (often tens of thousands) into a persistent VRAM storage buffer. It then yields to the OS, checks for network cancellations, and re-dispatches, picking up exactly where it left off.</p>
+                    </div>
+
+                    <p><strong>Trustless Hardware:</strong> Because GPU drivers can be buggy or non-deterministic, the GPU kernel is treated strictly as an oracle. It only surfaces <em>candidate</em> nonces. The CPU mathematically re-verifies every winning nonce using the canonical scalar function before broadcasting it to the network, guaranteeing consensus safety.</p>
+                </div>
+
+                <div class="tab-content" id="asert">
+                    <h3>ASERT Difficulty Adjustment</h3>
+                    <p>Sliding-window difficulty algorithms (like LWMA or Bitcoin's 2016-block window) are highly vulnerable to time-warp attacks, hash-and-flee exploits, and echo effects. mirstat adjusts difficulty continuously on <em>every block</em> based on the absolute time elapsed since genesis.</p>
+
+                    <ul>
+                        <li><strong>Target Block Time:</strong> 60 Seconds</li>
+                        <li><strong>Adaptation Half-Life:</strong> 4 Hours (240 Blocks)</li>
+                    </ul>
+
+                    <p>If the network hashrate spikes and blocks are mined in 30 seconds, the ASERT algorithm guarantees the difficulty will exactly double every 4 hours until the 60-second equilibrium is restored.</p>
+
+                    <div class="callout warn">
+                        <h4>The Determinism Problem</h4>
+                        <p>Calculating <code>2^x</code> requires floating-point math (IEEE 754). Different CPU architectures (x86 vs ARM) or even different compiler optimization flags can yield slightly different results at the far decimal places. In a consensus system, a 1-bit discrepancy results in a permanent chain fork.</p>
+                    </div>
+
+                    <p>mirstat solves this natively using deterministic integer math via a <strong>16.16 fixed-point Taylor polynomial</strong> approximation. It calculates the fractional exponent strictly using bitwise shifts, guaranteeing cross-architecture determinism.</p>
+
+                    <div class="math-block">
+                        let shifts = exponent >> 16;       // whole powers of 2<br>
+                        let frac = exponent & 0xFFFF;      // fractional part<br><br>
+                        let mut factor = 65536i64;<br>
+                        factor += (frac * 45426) >> 16;<br>
+                        factor += (frac * frac * 15746) >> 32;<br>
+                        factor += (frac * frac * frac * 3643) >> 48;
+                    </div>
+                </div>
+
+                <div class="tab-content" id="bayesian">
+                    <h3>Bayesian Finality: Autonomous Risk Management</h3>
+                    <p>Most blockchains rely on arbitrary "magic numbers" for finality (e.g., Bitcoin's 6-block rule). This assumes the network's hashpower distribution is static and universally honest. In reality, networks experience partitions, hashpower drops, and active 51% attacks.</p>
+
+                    <p>mirstat solves this by treating finality as a dynamic probability problem. Every node runs a <strong>Bayesian Finality Estimator</strong> that continuously models network health to calculate the exact depth <em>z</em> required to keep the risk of a chain reorganization below a strict <code>10<sup>-6</sup></code> threshold.</p>
+
+                    <div class="math-block">
+                        Expected Risk = ∫<sub>0</sub><sup>1</sup> P(catchup | p, z) * f<sub>Beta</sub>(p; α, β) dp &nbsp;≤&nbsp; 10<sup>-6</sup>
+                    </div>
+
+                    <div class="callout stark">
+                        <h4>Game Theory: Bankrupting the Attacker</h4>
+                        <p>In Bitcoin, an attacker renting hashpower for a 51% attack simply waits 6 blocks to execute an exchange double-spend. The cost of the attack is fixed and predictable.</p>
+                        <p>In mirstat, an attacker trying to secretly mine a shadow chain will inevitably cause orphan races. Every orphan increments <em>β</em> (adversarial prior) on honest nodes. As <em>β</em> rises, the variance of the Beta distribution widens, increasing the "tail risk". <strong>The integral forces the safe depth <em>z</em> to skyrocket.</strong></p>
+                        <p>Instead of waiting 6 blocks, merchants and exchanges are mathematically instructed by their nodes to wait 100+ blocks. The attacker is forced to burn millions of dollars sustaining their 51% hashpower monopoly for hours or days.</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="pool-mining">
+                    <h3>Provably Fair Stratum Pools</h3>
+                    <p>Because mirstat uses Sequential Hashing, traditional Bitcoin stratum protocols (where the pool builds the block and sends just the header to the miner) do not work. Miners must construct the block template locally to run the 1,000,000-hash state progression.</p>
+                    
+                    <p>To enable pooled mining without requiring miners to blindly trust the pool operator, mirstat employs a <strong>Decentralized-Auditable Merkle Precommitment</strong>.</p>
+
+                    <div class="callout stark">
+                        <h4>SPV-Audited Direct Payouts</h4>
+                        <p>When a miner connects, the pool doesn't hold the funds in custody. Instead, the pool's block template <strong>pays the miners directly</strong> in the coinbase transaction, strictly proportional to their submitted shares.</p>
+                        <p>To prove it isn't skimming or omitting miners, the pool builds a Merkle Tree of all current miner scores: <code>H(Miner_Address || Score)</code>. The 32-byte Merkle Root is embedded into the fee coin's salt inside the block template.</p>
+                        <p>Before computing a single hash, a miner's software queries the pool's HTTP Audit API for an <strong>O(log N) Merkle inclusion proof</strong>. If the pool operator lies about the miner's score or omits them, the local node instantly detects the mismatch and disconnects before hashing.</p>
+                    </div>
+
+                    <h4>Share Aggregation & Payouts</h4>
+                    <p>The pool server accepts shares at a lower difficulty target (e.g., 20 leading zeros instead of 30) and tallies them in an ACID database. If a submitted share happens to meet the actual network difficulty, the pool server immediately broadcasts it to the network as a full block win.</p>
+                    <p>Because the payouts are handled directly via the Coinbase transaction generated in the block template, there is no delayed payout process, no minimum withdrawal threshold, and no pool wallet that can be hacked or seized.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── ECONOMICS ── -->
+        <div class="content-pane" id="economics">
+            <h2>Economics & Supply</h2>
+            <p>Sound money requires an unforgeable costliness to produce and a strictly bounded, mathematically predictable supply schedule. mirstat enforces a disinflationary emission curve that asymptotically approaches a hard cap, but includes a vital tail emission to ensure perpetual security.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="supply-curve">Emission Schedule</button>
+                    <button class="tab-btn" data-tab="fee-market">Two-Dimensional Fee Market</button>
+                </div>
+
+                <div class="tab-content active" id="supply-curve">
+                    <div class="stat-grid">
+                        <div class="stat-card">
+                            <div class="stat-label">Maximum Supply</div>
+                            <div class="stat-value">~1.05M gMDS</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Halving Interval</div>
+                            <div class="stat-value">525,600 blocks (1 Year)</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Initial Reward</div>
+                            <div class="stat-value">1 gMDS</div>
+                        </div>
+                    </div>
+
+                    <div class="callout stark">
+                        <h4>Base-2 Denominations (gMDS, mMDS, kMDS)</h4>
+                        <p>Because mirstat enforces strict power-of-2 UTXO amounts (to fracture surveillance graphs), standard base-10 decimals are messy. Instead, mirstat uses computer-storage binary prefixes:</p>
+                        <ul>
+                            <li><strong>MDS:</strong> 1 base unit (2⁰)</li>
+                            <li><strong>kMDS:</strong> 1,024 MDS (2¹⁰)</li>
+                            <li><strong>mMDS:</strong> 1,048,576 MDS (2²⁰)</li>
+                            <li><strong>gMDS:</strong> 1,073,741,824 MDS (2³⁰)</li>
+                        </ul>
+                        <p>The initial block reward is exactly <strong>1 gMDS</strong> per block. The total maximum lifetime supply is roughly <strong>1.05 Million gMDS</strong> (1.12 Quadrillion base MDS units).</p>
+                    </div>
+
+                    <h3>The Disinflationary Curve</h3>
+                    <p>The block reward begins at <code>1 gMDS</code> per 60-second block. Every 525,600 blocks (exactly one year), the reward is bit-shifted to the right (halved).</p>
+                    
+                    <p>Unlike Bitcoin, which will eventually hit a block reward of exactly 0, mirstat enforces a <strong>Tail Emission</strong>. After 30 years, the block reward reaches a permanent floor of <code>1</code> unit per block. This guarantees miners are always mathematically incentivized to process blocks and secure the chain, even if transaction volume temporarily drops to zero.</p>
+
+                    <div style="background: var(--bg-alt); border: 1px solid var(--border); padding: 20px; margin-top: 24px;">
+                        <canvas id="supplyChart" height="120"></canvas>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="fee-market">
+                    <h3>The Two-Dimensional Fee Market</h3>
+                    <p>Most blockchains operate a single-dimensional fee market: you pay capital to buy block space. mirstat decouples transaction inclusion into two distinct markets, protecting edge nodes from spam while keeping fees predictable.</p>
+
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>Phase 1: Commits</strong><br><span style="color:var(--text-muted); font-size:12px;">Paid via Energy (PoW)</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>Phase 2: Reveals</strong><br><span style="color:var(--text-muted); font-size:12px;">Paid via Capital (Value)</span></div>
+                    </div>
+
+                    <h4>1. The Energy Market (Commits)</h4>
+                    <p>Because Commit transactions do not transfer value, they cannot pay a standard fee. Instead, users pay for mempool inclusion using CPU cycles. The required Proof-of-Work scales dynamically based on mempool congestion. If the network is quiet, a commit takes ~15 milliseconds to generate. If the network is under a DoS attack, the PoW requirement skyrockets, bankrupting the attacker's CPU resources before they can exhaust node RAM.</p>
+
+                    <h4>2. The Capital Market & RBF (Reveals)</h4>
+                    <p>Reveal transactions execute the actual state change and consume block space. Therefore, they must pay a capital fee. The node enforces a minimum relay fee of <strong>10 units per Kilobyte</strong>.</p>
+                    
+                    <div class="callout warn">
+                        <h4>Mempool Bounding & Replace-By-Fee (RBF)</h4>
+                        <p>To guarantee that mirstat can run on a 512MB Raspberry Pi indefinitely, the Mempool is mathematically capped at <strong>100 Megabytes</strong> or <strong>9,000 transactions</strong>, whichever is reached first.</p>
+                        <p>When the mempool fills up, the node initiates deterministic <strong>Replace-By-Fee (RBF)</strong> eviction. The node calculates the fee rate (<code>Fee / Byte Size</code>) of all pending transactions and permanently drops the lowest-paying transactions to make room for higher-paying ones. Because block space is scarce, users must bid against each other to have their Reveals mined during high congestion.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── GENESIS ── -->
+        <div class="content-pane" id="genesis">
+            <h2>Genesis Construction & Provable Fair Launch</h2>
+            <p>mirstat was engineered with absolute mathematical certainty that <strong>no pre-mining, no developer allocation, and no hidden coins ever existed</strong>. The entire genesis block is deterministically derived from a real, verifiable Bitcoin block mined in 2026 — making it impossible to have started the chain one second earlier.</p>
+
+            <div class="callout stark">
+                <h4>Bitcoin Block Anchor (Height 938708)</h4>
+                <p>The genesis <code>mirstat</code> is not arbitrary. It is constructed by hashing a specific Bitcoin block that everyone could independently verify existed on the Bitcoin network:</p>
+                <div class="math-block">
+                    // Bitcoin block used as cryptographic anchor
+                    BITCOIN_BLOCK_HASH   = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e"<br>
+                    BITCOIN_BLOCK_HEIGHT = 938708<br>
+                    BITCOIN_BLOCK_TIME   = 1772274770 (Feb 24 2026 UTC)<br><br>
+                    initial_mirstat = BLAKE3( BitcoinHash || Height.to_le_bytes() )
+                </div>
+                <p>Anyone can open any Bitcoin explorer (e.g. mempool.space, blockchain.com) and confirm this exact block existed. Because the mirstat genesis depends on its hash, the mirstat chain <strong>could not have been started before that Bitcoin block was mined</strong>.</p>
+            </div>
+
+            <h3>The Permanent Inscription (Burned Genesis Coins)</h3>
+            <p>The genesis coinbase creates exactly the initial reward of <code>1 gMDS</code> (1,073,741,824 MDS) — split into two power-of-2 outputs of 536,870,912 each.</p>
+            
+            <p>Instead of real public keys, the <code>address</code> and <code>salt</code> fields contain the following plaintext inscription, permanently embedded into the blockchain on disk:</p>
+            
+            <div class="terminal" style="font-size:13px; line-height:1.4;">
+                <div class="term-line">Harvest Now, Decrypt Later: The Quantum Era's Encryption Challenge</div>
+                <div class="term-line">(Published Feb 24, 2026, by RBC Disruptors)</div>
+            </div>
+
+            <p>This is the exact Rust code that generates the genesis block (from the canonical implementation):</p>
+            <pre><code>impl State {
+    pub fn genesis() -> (Self, Vec&lt;CoinbaseOutput&gt;) {
+        // Bitcoin block anchor
+        const BITCOIN_BLOCK_HASH: &amp;str = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+        const BITCOIN_BLOCK_HEIGHT: u64 = 938708;
+        const BITCOIN_BLOCK_TIME: u64 = 1772274770;
+
+        let anchor = hash(BITCOIN_BLOCK_HASH.as_bytes());
+
+        // --- The Genesis Inscription (split across address + salt) ---
+        let mut chunk0 = [0u8; 32]; chunk0.copy_from_slice(b"Harvest Now, Decrypt Later: The ");
+        let mut chunk1 = [0u8; 32]; chunk1.copy_from_slice(b"Quantum Era's Encryption Challen");
+        let mut chunk2 = [0u8; 32]; chunk2.copy_from_slice(b"ge (Published Feb 24, 2026, by R");
+        let mut chunk3 = [0u8; 32]; chunk3[..13].copy_from_slice(b"BC Disruptors)");
+
+        let genesis_coinbase = vec![
+            CoinbaseOutput { address: chunk0, value: 536_870_912, salt: chunk1 },
+            CoinbaseOutput { address: chunk2, value: 536_870_912, salt: chunk3 }
+        ];
+
+        let initial_mirstat = hash_concat(&amp;anchor, &amp;BITCOIN_BLOCK_HEIGHT.to_le_bytes());
+        // ... (difficulty target, MMR, etc.)
+        (state, genesis_coinbase)
+    }
+}</code></pre>
+
+            <div class="callout warn">
+                <h4>Why These Coins Are Mathematically Burned</h4>
+                <p>The <code>address</code> fields contain human-readable text instead of valid WOTS+ or MSS public keys. There is no corresponding private key anywhere in the universe that can spend them. The outputs are therefore <strong>provably unspendable</strong> — they are permanently removed from the circulating supply the instant the genesis block is created. This is the cryptographic equivalent of burning the initial coins in public.</p>
+            </div>
+
+            <h3>Mathematical Proof of No Pre-Mining</h3>
+            <ul>
+                <li><strong>Time-lock via Bitcoin anchor:</strong> The chain cannot exist before Bitcoin block 938708 was mined (verifiable by every node).</li>
+                <li><strong>Inscription date lock:</strong> The embedded message explicitly references February 24, 2026. Any earlier genesis would have a different anchor hash.</li>
+                <li><strong>Exact initial supply:</strong> 1 gMDS created in the coinbase, immediately burned → zero developer allocation, zero hidden pre-mine.</li>
+                <li><strong>Deterministic &amp; auditable:</strong> Every node recomputes the exact same genesis state from the same Bitcoin block. There is no “trusted setup” or hidden parameters.</li>
+            </ul>
+
+        </div>
+
+        <!-- ── PRIVACY ── -->
+        <div class="content-pane" id="privacy">
+            <h2>Privacy & MEV Resistance</h2>
+            <p>mirstat achieves profound transaction privacy without compromising the auditability of the global state.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="pow2-utxo">Power-of-2 UTXOs</button>
+                    <button class="tab-btn" data-tab="commit-reveal">Commit-Reveal Mempool</button>
+                    <button class="tab-btn" data-tab="coinjoin">Native CoinJoin</button>
+                </div>
+
+                <div class="tab-content active" id="pow2-utxo">
+                    <h3>The Fingerprint Problem & Power-of-2 UTXOs</h3>
+                    <p>In standard blockchains, UTXOs have unique, highly specific amounts (e.g., <code>1.45239</code> coins). These exact amounts act as cryptographic fingerprints. When a user sends <code>1.0</code> coins and receives <code>0.45239</code> back as change, blockchain surveillance firms can easily deduce which output was the payment and which was the change, tracing value graphs across dozens of hops even through naive mixers.</p>
+
+                    <p><strong>mirstat radically solves this by forcing all UTXOs to be strict powers of 2 (1, 2, 4, 8, 16, 32...).</strong></p>
+
+                    <p>Because there are no arbitrary denominations, every 16-value coin looks identical to every other 16-value coin on the network. A user cannot send <code>10</code> coins; their wallet automatically breaks the transaction down into independent <code>8</code> and <code>2</code> coin sends. This naturally fractures tracking graphs.</p>
+                </div>
+
+                <div class="tab-content" id="commit-reveal">
+                    <h3>MEV Resistance: Two-Phase Mempool</h3>
+                    <p>Standard mempools broadcast transaction details in cleartext, allowing miners to reorder or front-run trades (Miner Extractable Value). mirstat enforces a two-phase Commit-Reveal protocol:</p>
+
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>1. Commit</strong><br><span style="color:var(--text-muted); font-size:12px;">Blinded hash + Anti-Spam PoW</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>2. Mine</strong><br><span style="color:var(--text-muted); font-size:12px;">Miner commits to processing tx</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>3. Reveal</strong><br><span style="color:var(--text-muted); font-size:12px;">Reveal details and pay fee</span></div>
+                    </div>
+                    
+                    <p>The Commit phase binds the transaction inputs and outputs via a <code>BLAKE3</code> hash. The network sees a commit, but has no idea who is sending money to whom, or how much. Only after the commit is permanently mined into a block does the user broadcast the Reveal, providing the signatures to execute the spend.</p>
+
+                    <p>This mechanism blinds transaction topology prior to block inclusion and enforces perfect subset sum ambiguity upon execution.</p>
+
+                    <details class="deep-dive">
+                        <summary>Dynamic Anti-Spam PoW</summary>
+                        <div class="dd-content">
+                            <p>To prevent attackers from filling the mempool with free commitments (which cost zero fees), the node dynamically enforces an anti-spam PoW requirement (<code>spam_nonce</code>) that scales automatically under network congestion.</p>
+                            <p>If the mempool has &lt;500 pending commits, the requirement is 24 leading zero bits (~16M hashes, ~15ms). If the pool fills to 900+, the requirement jumps to 30 bits (~1B hashes, ~1s), throttling spam while remaining virtually instant for legitimate users submitting a single transaction.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="tab-content" id="coinjoin">
+                    <h3>Native CoinJoin</h3>
+                    <p>mirstat ships a <strong>denomination-uniform CoinJoin</strong> mixer built directly into the wallet and P2P layer. The final on-chain transaction is an ordinary <code>Reveal</code> that passes every validation rule. The privacy guarantee is mathematical: because every input and every output (except the mandatory fee coin) has identical power-of-2 value, subset-sum analysis yields <em>zero</em> information about the input→output mapping.</p>
+                    
+                    <div class="callout stark">
+                        <h4>Core Invariants (from <code>wallet/coinjoin.rs</code>)</h4>
+                        <ul>
+                            <li><code>MIN_MIX_PARTICIPANTS = 2</code>, <code>MAX_MIX_PARTICIPANTS = 16</code></li>
+                            <li>All mix inputs <strong>and</strong> outputs must share the exact same power-of-2 denomination (1, 2, 4, …, 2⁶³)</li>
+                            <li>Exactly one additional input of value <code>1</code> covers the mandatory network fee</li>
+                            <li>Coordinator is <strong>ephemeral</strong> — any node can start a session; no trusted third party</li>
+                        </ul>
+                    </div>
+
+                    <h4>Ephemeral CoinJoin Coordination (libp2p)</h4>
+                    <p>Any node can initialise a session by broadcasting a <code>MixAnnounce</code> message containing a unique <code>MixID</code> and the target denomination.</p>
+
+                    <p class="callout" style="margin-top:12px;">The coordinator broadcasts the session. Peers prove they control a real coin (and are not Sybils) by solving a <code>BLAKE3</code> PoW challenge bound to their <code>PeerId</code> and <code>coin_id</code>. This anti-Sybil mechanism requires 30 leading zero bits (approx. 1 billion hashes), heavily punishing Sybil attackers.</p>
+                    
+                    <p class="callout" style="margin-top:12px;"> Participants register their <code>InputReveal</code> and desired <code>OutputData</code>. When the session reaches the minimum participant count and the fee input is supplied, the coordinator produces a <strong>deterministic</strong> <code>MixProposal</code> (see <code>MixSession::proposal()</code>). Inputs are sorted by <code>coin_id</code> (mix coins first, fee last); outputs are sorted by <code>coin_id</code>. This ordering guarantees every honest participant computes the exact same commitment hash.</p>
+
+                    <p class="callout" style="margin-top:12px;"> This is the <strong>trustless verification step</strong>. Each peer independently checks that the coordinator has not altered, omitted, or stolen their outputs before signing the single 32-byte commitment hash. If the check fails, the peer aborts — the coordinator gains nothing. The collected signatures are later assembled into the final <code>Reveal</code> transaction.</p>
+
+                    <h4>Dandelion++ Stem Routing (Post-Mix Privacy)</h4>
+                    <p>After the reveal is constructed, the wallet routes the final <code>Reveal</code> transaction through Dandelion++ to decouple the broadcasting node’s IP from the transaction payload.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── STATE MGMT & SYNC ── -->
+        <div class="content-pane" id="state">
+            <h2>State Management & Syncing</h2>
+            <p>mirstat discards the traditional unbounded UTXO database model (like Bitcoin's LevelDB). Instead, unspent outputs, pending commitments, and chain history are mathematically accumulated into cryptographically verifiable data structures, strictly bounding the RAM requirements for edge devices.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="state-smt">SMT & MMR Architecture</button>
+                    <button class="tab-btn" data-tab="state-pruning">Pruning & Licenses</button>
+                    <button class="tab-btn" data-tab="state-sync">Fast-Forward Sync & Snapshots</button>
+                    <button class="tab-btn" data-tab="state-filters">Compact Filters</button>
+                </div>
+
+                <div class="tab-content active" id="state-smt">
+                    <h3>The SMT & MMR State Root</h3>
+                    <p>The global <code>state_root</code> of the mirstat network is a combination of two distinct data structures:</p>
+                    
+                    <h4>1. The UTXO Sparse Merkle Tree (SMT)</h4>
+                    <p>Active UTXOs and mempool commitments are stored in a 256-level Sparse Merkle Tree. To achieve <code>O(log N)</code> insertion and verification without overflowing the RAM of edge devices, the tree is split into two access tiers:</p>
+                    <ul>
+                        <li><strong>Top Cache:</strong> The top 16 levels are cached persistently in memory, strictly bounded to a maximum of 65,536 nodes.</li>
+                        <li><strong>Dynamic Folding:</strong> The bottom 240 levels are computed on the fly when proofs are required. Because coins are sorted lexicographically by their 32-byte hashes, this is computed near-instantly via binary searching over buckets.</li>
+                    </ul>
+
+                    <h4>2. The Merkle Mountain Range (MMR)</h4>
+                    <p>While the SMT tracks <em>active</em> state, the MMR tracks <em>historical</em> state. Every time a block is mined, its <code>final_hash</code> is appended to the MMR. This provides an append-only log of the entire chain history, allowing light clients to request <code>O(log N)</code> inclusion proofs to verify that a specific block existed at a specific height in the past.</p>
+                    
+                    <div class="math-block">
+                        // The Final State Root Equation<br>
+                        smt_root = BLAKE3( utxo_smt_root || pending_commitments_smt_root )<br>
+                        state_root = BLAKE3( smt_root || historical_chain_mmr_root )
+                    </div>
+                </div>
+
+                <div class="tab-content" id="state-pruning">
+                    <h3>Pruning Licenses & Cap-and-Trade</h3>
+                    <p>Unlike traditional blockchains where every node must store the entire history forever, mirstat uses a <strong>Cap-and-Trade</strong> market for historical data storage.</p>
+
+                    <p>Nodes can safely discard historical blocks (Pruning Mode) without being penalized by their peers, provided they hold a <strong>Pruning License</strong>. These licenses are created by Archiver nodes who cryptographically prove they possess the historical data.</p>
+
+                    <h4>Proof of Archival Work (PoAW)</h4>
+                    <p>To issue a license, an Archiver must perform heavy, address-salted PoW over historical block payloads. The resulting Merkle Root is stored on-chain inside a <code>Confidential</code> UTXO (a State Thread). This creates a verifiable, tradable <strong>Bearer Asset</strong> representing archival capacity.</p>
+
+                    <h4>Bayesian Reputation & Gossip Challenges</h4>
+                    <p>A license is only as good as the Archiver backing it. Nodes continuously audit license issuers using <strong>MMR Gossip Challenges</strong> sent over the ephemeral P2P Chat bus. If an Archiver fails to provide the requested data block, nodes update their internal Bayesian estimator, slashing the Archiver's reputation.</p>
+                    
+                    <p>If an Archiver's reputation drops too low, the Pruning Licenses they issued lose their exemption power, forcing Pruners to buy higher-quality licenses from reliable Archivers, creating a free market for decentralized storage.</p>
+                </div>
+
+                <div class="tab-content" id="state-sync">
+                    <h3>Fast-Forward Syncing</h3>
+                    <p>A major issue with sequential hashing is the sync time. If a node goes offline for a month, replaying 1,000,000 hashes per block to catch up would take days on a Raspberry Pi. mirstat solves this via cryptographic Fast-Forwarding.</p>
+
+                    <p>Nodes save full state snapshots to disk every 100 blocks. When a node is syncing, it can download a recent snapshot from a peer instead of starting from genesis.</p>
+
+                    <div class="callout stark">
+                        <h4>Snapshot Cryptographic Validation</h4>
+                        <p>How does a node trust a peer's snapshot without replaying the history? It uses the headers. The node downloads the lightweight headers and verifies the Proof-of-Work. If the very first header mathematically builds exactly on top of the downloaded snapshot's <code>mirstat</code>, the snapshot is authentic.</p>
+                        <p><strong>The Security Gate:</strong> To prevent an attacker from forging a fake snapshot and mining just 1 or 2 blocks on top of it, mirstat enforces a <code>PRUNE_DEPTH</code> rule. A node will only trust a snapshot if the peer can provide 1,000 valid blocks of Proof-of-Work natively built on top of it (1 billion sequential hashes). This makes state injection economically impossible.</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="state-filters">
+                    <h3>Compact Block Filters (Neutrino Privacy)</h3>
+                    <p>Light wallets need to know when they receive funds, but asking a public RPC node "Do you have any transactions for Address X?" completely destroys user privacy, linking their IP address to their wallet balance.</p>
+
+                    <p>mirstat implements client-side block filtering using <strong>Golomb-Rice Coding (P=20)</strong>. Instead of asking for specific addresses, the wallet downloads a tiny, highly compressed filter (a few kilobytes) for each block.</p>
+
+                    <ul>
+                        <li><strong>Local Matching:</strong> The wallet checks its own addresses against the filter locally. If there is a match (which includes a 1-in-1,000,000 false positive rate), the wallet downloads the <em>entire raw block</em> and scans it locally.</li>
+                        <li><strong>Zero Knowledge Leakage:</strong> The RPC node never learns which addresses the wallet actually owns; it only sees the wallet requesting sequential filter data and occasional full blocks.</li>
+                        <li><strong>Precomputation Defense:</strong> To prevent malicious miners from artificially bloating filters or crafting false positives, all elements inserted into the filter are cryptographically keyed using the block's <code>final_hash</code>.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── VM ── -->
+        <div class="content-pane" id="vm">
+            <h2>Virtual Machine</h2>
+            <p>Every UTXO in mirstat is locked by a compiled bytecode script. The VM executes witness inputs pushed onto the <code>SmallVec</code> stack, then evaluates the locking script. Execution succeeds if and only if the final top-of-stack item is exactly <code>[1]</code>.</p>
+
+            <p>The stack machine in mirstat is Turing-incomplete by design — no loops, no unbounded recursion, no on-chain state mutation. However, it features <strong>output introspection</strong> via <code>OP_SUM_TO_ADDR</code> and <strong>State Threads</strong> via <code>OP_READ_INPUT_STATE</code>. These capabilities unlock Covenants, AMMs, native tokens, and DAOs without any of the security risks associated with EVM smart contracts.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Max Script Size</div>
+                    <div class="stat-value">1,024 bytes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Max Stack Depth</div>
+                    <div class="stat-value">64 items</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Clean Stack Rule</div>
+                    <div class="stat-value">Exactly [1]</div>
+                </div>
+            </div>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="vm-midscript">Midscript (High-Level)</button>
+                    <button class="tab-btn" data-tab="vm-state">State Threads (eUTXO)</button>
+                    <button class="tab-btn" data-tab="vm-p2pk">P2PK</button>
+                    <button class="tab-btn" data-tab="vm-multisig">Multi-Sig</button>
+                    <button class="tab-btn" data-tab="vm-htlc">Atomic Swap (HTLC)</button>
+                    <button class="tab-btn" data-tab="vm-timelock">Timelocks</button>
+                    <button class="tab-btn" data-tab="vm-covenant">Covenants</button>
+                    <button class="tab-btn" data-tab="vm-opcodes">Opcode Reference</button>
+                </div>
+                <!-- ── MIDSCRIPT ─────────────────────────────────────────────────── -->
+                <div class="tab-content active" id="vm-midscript">
+                    <div style="margin-bottom: 48px; border-bottom: 2px solid var(--border); padding-bottom: 24px;">
+                        <h2 style="border:none; padding:0; margin:0 0 8px 0; font-size: 32px;">The Midscript Programming Language</h2>
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-faint);">Definitive Reference Manual · Edition 1.0</div>
+                    </div>
+
+                    <p>Midscript is a statically-analyzed, macro-expanded programming language designed specifically for the mirstat Virtual Machine. Where languages like C abstract the physical hardware of a von Neumann architecture, Midscript abstracts a deterministic, resource-constrained cryptographic stack machine.</p>
+
+                    <p>The language operates in an environment entirely devoid of a heap, call frames, pointers, or garbage collection. Midscript exists purely as a compile-time semantic analyzer. Variables are not mapped to memory addresses; they are calculated topological offsets on a physical execution stack. When Midscript is compiled, all high-level abstractions dissolve entirely, producing a contiguous, flattened array of zero-overhead native opcodes.</p>
+
+                    <div class="callout stark">
+                        <h4>Axiom 1: The Clean Stack Theorem</h4>
+                        <p>The foundational invariant of the mirstat VM is the Clean Stack Rule. A script is evaluated as mathematically <strong>Valid</strong> if and only if, upon the execution of the final opcode, the physical stack contains exactly one item, and that item is strictly equal to the boolean representation of True (<code>0x01</code>).</p>
+                        <p>If the stack is empty, if it resolves to zero, or if it contains leftover garbage items (e.g., <code>[0x01, 0x05]</code>), the network violently rejects the transaction. Midscript is engineered to satisfy this theorem systematically via strict lexical block-scoping.</p>
+                    </div>
+
+                    <!-- ── SECTION 1: EXECUTION ENVIRONMENT ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">1. The Execution Environment</h3>
+                    <p>Before understanding the language, one must understand the machine architecture it targets. The mirstat VM is Turing-incomplete by design, enforcing strict <code>O(1)</code> execution time bounds per opcode to prevent halting-problem vulnerabilities and infinite loops.</p>
+                    
+                    <p>When a transaction attempts to spend a UTXO, the node constructs a physical execution environment. The VM begins in a halted, empty state. First, the <strong>Witness</strong> (the cryptographic proofs provided by the spender) is sequentially pushed onto the stack. Only then does the VM begin executing the compiled Midscript bytecode.</p>
+
+                    <ul style="margin-top: 16px;">
+                        <li><strong>Stack Depth Limit:</strong> The physical stack may never exceed 64 items at any point during execution. Exceeding this triggers an immediate `Stack Overflow` panic.</li>
+                        <li><strong>Item Size Limit:</strong> No single stack item may exceed 1,536 bytes. This prevents memory-exhaustion attacks via massive data concatenation.</li>
+                        <li><strong>SigOp Limit:</strong> Execution is aborted if more than 3 cryptographic signature verifications (<code>CHECKSIG</code>, <code>CHECKSIGVERIFY</code>) are evaluated dynamically at runtime.</li>
+                        <li><strong>Arithmetic Bounds:</strong> All mathematics are bounded to 64-bit signed integers. Division by zero, or subtraction resulting in an underflow, trigger native VM panics. There is no silent wrapping.</li>
+                    </ul>
+
+                    <!-- ── SECTION 2: TYPES AND INGESTION ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">2. Types and The Witness</h3>
+                    <p>The mirstat VM natively understands only raw byte arrays. To ensure execution safety and prevent illegal mathematical operations on cryptographic hashes, the Midscript compiler overlays a bipartite type system.</p>
+
+                    <ul>
+                        <li><strong>Integer (<code>int</code>):</strong> Base-10 numerical literals (e.g., <code>1000</code>). The compiler converts these into strict little-endian byte sequences and emits the <code>PUSH_INT</code> opcode. All mathematical operators strictly require <code>int</code> operands.</li>
+                        <li><strong>Hexadecimal (<code>hex</code>):</strong> Raw byte sequences enclosed in quotes (e.g., <code>"a1b2c3"</code>). Length must be even. The compiler emits <code>PUSH_HEX</code>. Hex strings cannot be evaluated mathematically.</li>
+                        <li><strong>Boolean:</strong> The VM lacks a native boolean type. The keywords <code>true</code> and <code>false</code> are semantic sugar; the compiler emits <code>PUSH_INT 1</code> and <code>PUSH_INT 0</code> respectively.</li>
+                    </ul>
+
+                    <h4>The Witness (Data Ingestion)</h4>
+                    <p>Because smart contracts cannot prompt for user input at runtime, external data (signatures, public keys, routed amounts) is pushed to the physical stack <em>before</em> the script begins executing. This pre-loaded data constitutes the Witness.</p>
+                    <p>To ingest this data safely into the compiler's type-tracker, Midscript provides typed pop directives. These functions <strong>do not emit opcodes</strong>; they simply instruct the compiler to map an identifier to a pre-existing item on the physical stack.</p>
+                    <pre><code>// The Witness pushed [Signature, Amount]. The stack operates as LIFO.
+// Therefore, 'Amount' is at the top of the stack, and 'Signature' is underneath it.
+
+var amount = pop_int();       // Compiler registers top item as type 'int'
+var signature = pop_hex();    // Compiler registers the next item as type 'hex'</code></pre>
+
+                    <!-- ── SECTION 3: TOPOLOGICAL MEMORY MODEL ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">3. Topological Memory Model</h3>
+                    <p>Unlike languages that map variables to RAM or register addresses, Midscript maps variables strictly to a shifting physical stack depth.</p>
+
+                    <h4>Deep Fetching (<code>OP_PICK</code>)</h4>
+                    <p>When the <code>var</code> keyword is used, the compiler registers that variable's current index in its internal <code>locals</code> array. Later, when the variable is referenced in an expression, the CodeGen engine dynamically calculates its exact physical depth relative to the current execution head.</p>
+                    <p>The compiler then emits the most efficient sequence of opcodes to copy that value to the top of the stack:</p>
+                    
+                    <div class="math-block">
+                        Depth 0 (Top Item): Emits <code>DUP</code><br>
+                        Depth 1 (Second Item): Emits <code>OVER</code><br>
+                        Depth N (Deeper Items): Emits <code>PUSH_INT N</code> followed by <code>PICK</code>
+                    </div>
+
+                    <h4>Lexical Scoping & Auto-Drop</h4>
+                    <p>Midscript uses brackets <code>{ ... }</code> to define lexical scope. When a block is opened, the compiler snapshots the environment. When the block closes, the compiler automatically determines how many new variables were created within that block, and injects exactly that many <code>DROP</code> opcodes into the bytecode.</p>
+                    
+                    <pre><code>{
+    var temp_x = pop_int();
+    var temp_y = pop_int();
+    assert(temp_x > temp_y);
+} // The compiler observes 2 local variables going out of scope.
+  // It automatically injects 'DROP DROP' here to wipe them.
+
+true; // The stack is now perfectly clean, containing only [0x01].</code></pre>
+
+                    <!-- ── SECTION 4: THE MUTABILITY CONSTRAINT ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">4. The Mutability Constraint</h3>
+                    <p>While variables can be reassigned via standard syntax (e.g., <code>x = x + 10;</code>), Midscript is fundamentally hostile to deep mutability. This is dictated by the limitations of the underlying VM architecture.</p>
+
+                    <p>To mutate a variable deep in the stack, a VM must pull the item to the top, destroy it, push the new value, and bury it back down to its original depth. Because the mirstat VM explicitly excludes arbitrary-depth replacement opcodes (like Bitcoin's disabled <code>OP_ROLL</code>) to prevent CPU-stalling attacks, <strong>variable mutation is physically restricted to Depth 1 and Depth 2</strong>.</p>
+
+                    <pre><code>var a = pop_int(); // Current Depth 2
+var b = pop_int(); // Current Depth 1
+
+a = a + 10; // Valid. Emits: [Eval Math] -> ROT -> DROP -> SWAP
+b = b + 10; // Valid. Emits: [Eval Math] -> SWAP -> DROP
+
+// If 'a' fell to depth 3, compilation would immediately halt with a Semantic Error.</code></pre>
+
+                    <div class="callout warn">
+                        <h4>Design Rationale: Shadowing over Mutation</h4>
+                        <p>The idiomatic approach to state progression in Midscript is <strong>Variable Shadowing</strong>. Because the VM stack supports up to 64 items, developers should simply declare new variables (<code>var new_a = a + 10;</code>). This leaves the old value buried safely in the stack to be automatically <code>DROP</code>ped at the end of the lexical block, entirely bypassing the severe opcode cost and restrictions of physical stack manipulation.</p>
+                    </div>
+
+                    <!-- ── SECTION 5: EXPRESSIONS AND FOLDING ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">5. Expressions & Constant Folding</h3>
+                    <p>Midscript parses standard infix expressions according to traditional mathematical precedence rules (Multiplication > Addition > Comparison > Logical). The Abstract Syntax Tree (AST) parser automatically transposes these into postfix stack bytecode.</p>
+
+                    <p>For example, the expression <code>a + b * c</code> is compiled into the physical sequence: <code>&lt;fetch b&gt; &lt;fetch c&gt; MUL &lt;fetch a&gt; ADD</code>.</p>
+
+                    <h4>Compile-Time Constant Folding</h4>
+                    <p>The <code>let</code> keyword defines a compile-time constant. If the CodeGen engine detects an arithmetic operation occurring strictly between static literals or constants, it evaluates the mathematics entirely during compilation and emits a single, finalized <code>PUSH_INT</code>.</p>
+                    <p>For example, <code>1000 * 60 * 24</code> never generates <code>MUL</code> opcodes in the final bytecode; the compiler directly injects <code>PUSH_INT 1440000</code>. This drastically reduces contract size and runtime execution cost.</p>
+
+                    <h4>Operator Synthesization</h4>
+                    <p>To preserve instruction-set simplicity, the mirstat VM supports only <code>EQUAL</code> and <code>GREATER_OR_EQUAL</code> natively. The Midscript CodeGen engine seamlessly synthesizes all remaining comparison and logical operators at compile time.</p>
+                    <div class="math-block">
+                        &gt;&nbsp;&nbsp; synthesizes to: PUSH_INT 1 ADD GREATER_OR_EQUAL<br>
+                        &lt;=&nbsp; synthesizes to: SWAP GREATER_OR_EQUAL<br>
+                        &lt;&nbsp;&nbsp; synthesizes to: SWAP PUSH_INT 1 ADD GREATER_OR_EQUAL<br>
+                        &amp;&amp;&nbsp; synthesizes to: ADD PUSH_INT 2 EQUAL<br>
+                        ||&nbsp; synthesizes to: ADD PUSH_INT 1 GREATER_OR_EQUAL
+                    </div>
+
+                    <!-- ── SECTION 6: CONTROL FLOW ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">6. Control Flow and Branching</h3>
+
+                    <h4>If / Else</h4>
+                    <p>Compiles directly to the native <code>IF</code>, <code>ELSE</code>, and <code>ENDIF</code> opcodes. Crucially, the <code>IF</code> opcode physically consumes the top stack item. The compiler implicitly ensures the evaluated condition is left on the stack prior to the jump, guaranteeing stack alignment.</p>
+
+                    <h4>Switch</h4>
+                    <p>The <code>switch</code> construct abstracts sequential equality testing. The compiler generates an unbroken chain of <code>DUP</code>, evaluation, <code>EQUAL</code>, and <code>IF ... ELSE</code> jumps. Every <code>case</code> block is fully sandboxed lexically, meaning variables declared within a case are dropped before the switch terminates.</p>
+
+                    <h4>Route</h4>
+                    <p>A specialized architectural version of <code>switch</code> designed exclusively for the top-level contract entry point. It evaluates against an implicit <code>ImplicitTop</code> token—assuming the Witness stack has provided an integer explicitly dictating the execution path.</p>
+                    <pre><code>// Witness Stack expected: [Signature, Routing_Integer]
+route {
+    case 0: { require_signed_by(ALICE_PK); }
+    case 1: { require_signed_by(BOB_PK); }
+    default: { fail(); }
+}</code></pre>
+
+                    <h4>Repeat (Unrolling)</h4>
+                    <p>Because Turing-incompleteness strictly forbids arbitrary backward jumping (looping), the <code>repeat(N)</code> construct instructs the compiler to physically duplicate and unroll the AST block <code>N</code> times in the final bytecode array. This is primarily used for deep Merkle Tree verification steps.</p>
+
+                    <!-- ── SECTION 7: E-UTXO STATE ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">7. Extended UTXO State & Structs</h3>
+                    <p>mirstat supports <strong>State Threads</strong>—an advanced capability allowing zero-value UTXOs to carry a mutable 32-byte data payload. This enables Cardano-style Extended UTXO (eUTXO) smart contracts, including AMMs and native token issuance. Midscript provides a first-class abstraction for accessing this payload via byte-offset mapping.</p>
+
+                    <pre><code>state Vault {
+    collateral: 8, // Offset 0, Size 8 bytes
+    debt: 8,       // Offset 8, Size 8 bytes
+    padding: 16    // Offset 16, Size 16 bytes
+}</code></pre>
+
+                    <p>When code requests <code>Vault.debt</code>, the compiler does not dynamically search memory. It statically emits the sequence: <code>READ_INPUT_STATE</code> → <code>PUSH_INT 8</code> (offset) → <code>PUSH_INT 8</code> (length) → <code>SLICE</code>.</p>
+                    
+                    <div class="callout stark">
+                        <h4>Automatic Mathematical Casting</h4>
+                        <p>The VM distinguishes strictly between byte arrays and integers. A <code>SLICE</code> operation returns raw, un-mathable bytes. However, if a mapped <code>state</code> or <code>struct</code> field is defined with a physical size of 8 bytes or fewer, the compiler safely assumes it represents numeric data. It automatically appends <code>PUSH_INT 0 ADD</code>, instantly casting the raw hex slice into an actionable <code>int</code> for arithmetic processing.</p>
+                    </div>
+
+                    <!-- ── SECTION 8: MACROS ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">8. Macros and Syntactic Abstraction</h3>
+                    <p>Because the mirstat VM has no concept of an execution pointer or a call stack, standard functions are impossible. The <code>macro</code> keyword defines a reusable Abstract Syntax Tree (AST) fragment that is evaluated strictly at compile time.</p>
+
+                    <p>When a macro is invoked, the compiler performs the following sequence:</p>
+                    <ol>
+                        <li>Takes a snapshot of the current <code>locals</code> variable array.</li>
+                        <li>Registers the passed arguments as new physical variables on the stack.</li>
+                        <li>Unrolls the macro's inner AST into the CodeGen stream.</li>
+                        <li>Injects the necessary <code>DROP</code> opcodes to wipe the macro's parameters.</li>
+                        <li>Restores the exact <code>locals</code> snapshot that existed prior to invocation.</li>
+                    </ol>
+
+                    <pre><code>macro verify_transfer(dest_addr, amount) {
+    assert(sum_to_addr(dest_addr) >= amount);
+}</code></pre>
+
+                    <!-- ── SECTION 9: STANDARD LIBRARY ── -->
+                    <h3 style="margin-top: 56px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">9. The Standard Library</h3>
+                    <p>The compiler auto-injects a standardized, unmodifiable library of primitives into every compilation environment, wrapping the raw opcodes in type-safe macro definitions.</p>
+
+                    <table>
+                        <thead><tr><th>Operation</th><th>Emitted Opcodes / Behavior</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">STACK & TYPE ASSERTIONS</th></tr>
+                            <tr><td class="hl"><code>pop_int() / pop_hex()</code></td><td>(None)</td><td>Informs compiler a value was pushed by the witness, typing it accordingly.</td></tr>
+                            <tr><td class="hl"><code>size(val)</code></td><td><code>val SIZE SWAP DROP</code></td><td>Pushes the physical byte-length of the value.</td></tr>
+                            <tr><td class="hl"><code>assert(expr)</code></td><td><code>[expr] VERIFY</code></td><td>Evaluates expression and aborts execution if it resolves to 0.</td></tr>
+                            <tr><td class="hl"><code>fail()</code></td><td><code>PUSH_INT 0 VERIFY</code></td><td>Forces an immediate execution halt.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">CRYPTOGRAPHY & SIGNATURES</th></tr>
+                            <tr><td class="hl"><code>hash(val)</code></td><td><code>val HASH</code></td><td>Executes a post-quantum BLAKE3 hash on the value.</td></tr>
+                            <tr><td class="hl"><code>require_preimage(h)</code></td><td><code>HASH h EQUALVERIFY</code></td><td>Hashes the top item and aborts if it does not equal <code>h</code>.</td></tr>
+                            <tr><td class="hl"><code>check_sig(pk)</code></td><td><code>pk CHECKSIG</code></td><td>Verifies WOTS+/MSS signature against pubkey. Pushes 1 or 0.</td></tr>
+                            <tr><td class="hl"><code>require_sig(pk)<br>require_signed_by(pk)</code></td><td><code>pk CHECKSIGVERIFY</code></td><td>Verifies signature. Aborts immediately if invalid.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">COVENANTS & INTROSPECTION</th></tr>
+                            <tr><td class="hl"><code>require_time(h)<br>require_timelock(h)</code></td><td><code>h CHECKTIMEVERIFY</code></td><td>Aborts if current block height is less than <code>h</code>.</td></tr>
+                            <tr><td class="hl"><code>input_value()</code></td><td><code>INPUT_VALUE</code></td><td>Pushes the exact Satoshi value of the currently executing input.</td></tr>
+                            <tr><td class="hl"><code>this_address()</code></td><td><code>THIS_ADDRESS</code></td><td>Pushes the 32-byte address of the executing script itself.</td></tr>
+                            <tr><td class="hl"><code>output_address(i)</code></td><td><code>i OUTPUT_ADDRESS</code></td><td>Pushes the 32-byte address of the newly created output at index <code>i</code>.</td></tr>
+                            <tr><td class="hl"><code>sum_to_addr(a)</code></td><td><code>a SUM_TO_ADDR</code></td><td>Sums the Satoshi values of all outputs sent to address <code>a</code>.</td></tr>
+                            <tr><td class="hl"><code>read_input_state()</code></td><td><code>READ_INPUT_STATE</code></td><td>Pushes the 32-byte payload of the executing State Thread.</td></tr>
+                            <tr><td class="hl"><code>read_output_state(i)</code></td><td><code>i READ_OUTPUT_STATE</code></td><td>Pushes the 32-byte payload assigned to output <code>i</code>.</td></tr>
+                            
+                            <tr><th colspan="3" style="text-align:center; background:var(--bg); color:var(--text-muted); font-size:12px;">DATA MANIPULATION</th></tr>
+                            <tr><td class="hl"><code>slice(val, off, len)</code></td><td><code>val off len SLICE</code></td><td>Extracts a specific byte sequence.</td></tr>
+                            <tr><td class="hl"><code>concat(a, b)</code></td><td><code>a b CONCAT</code></td><td>Merges two byte arrays into one contiguous structure.</td></tr>
+                        </tbody>
+                    </table>
+
+                    <!-- ── SECTION 10: RAW ASSEMBLY ── -->
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">10. Raw Assembly Interoperability</h3>
+                    <p>If absolute byte-level optimization is required, developers may intentionally bypass the Midscript type-checker by writing raw mirstat Assembly mnemonics in all-caps. The compiler treats these as untyped injection directives, verifying only that they do not violate the compiler's internal stack-depth safety tracker.</p>
+                    <pre><code>let MASTER_KEY = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+// Pure bytecode injection
+PUSH_HEX(MASTER_KEY);
+CHECKSIGVERIFY;</code></pre>
+
+                    <!-- ── SECTION 11: TEST HARNESS ── -->
+                    <h3 style="margin-top: 48px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">11. The Headless Test Harness</h3>
+                    <p>Midscript ships with a native <code>test</code> construct. Tests are isolated code branches ignored by standard compilation. When the <code>Run Tests</code> action is invoked via the IDE, the compiler instantiates a headless, simulated stack environment for each test block.</p>
+                    <p>The environment strictly enforces all consensus invariants: the maximum stack depth of 64, maximum item sizes of 1,536 bytes, 64-bit mathematical overflow limits, and the absolute requirement that execution must cleanly resolve to <code>[0x01]</code>.</p>
+                    
+                    <pre><code>test "Validates a Left-Sibling Merkle Step" {
+    // 1. Manually setup Mock Stack: [Sibling, Direction(Left=1), Current]
+    push_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    push_int(1); 
+    push_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    
+    // 2. Execute the macro
+    merkle_step();
+    
+    // 3. Assert the mathematical result
+    push_hex("7e244b7fa716d86fb5a0f274291c984caebef9df451e0ff0d48cb96d66e74b3e"); 
+    assert(pop_hex() == pop_hex()); 
+}</code></pre>
+                </div>
+                
+                <!-- ── STATE THREADS ─────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-state">
+                    <h3>State Threads (Extended UTXO)</h3>
+                    <p>At Block 65,000, mirstat activates the <strong>State Threads</strong> soft-fork, officially upgrading the network from stateless scripting to a full Cardano-style Extended UTXO (eUTXO) smart contract platform.</p>
+
+                    <div class="callout stark">
+                        <h4>What is a State Thread?</h4>
+                        <p>A State Thread is a special UTXO with a value of exactly <code>0</code>. Because it has no monetary value, anyone can attach one to a transaction for free. Instead of holding coins, it carries a mutable <strong>32-byte State Variable</strong>. When you spend a State Thread, the locking script can read the old state, execute logic, and enforce what the <em>next</em> 32-byte state must be.</p>
+                    </div>
+
+                    <h4>The Two Magic Opcodes</h4>
+                    <p>State Threads are driven by two new opcodes (available in Midscript as functions):</p>
+                    <ul>
+                        <li><code>read_input_state()</code>: Pushes the 32-byte state of the currently executing input onto the stack.</li>
+                        <li><code>read_output_state(index)</code>: Pushes the 32-byte state of the newly created output at the specified index.</li>
+                    </ul>
+
+                    <h4>Example: A Decentralized DEX Limit Order</h4>
+                    <p>Stateless blockchains can't do limit orders natively because they can't "remember" partial fills. State Threads solve this instantly. A Maker locks 10,000 coins in a contract, and sets a State Thread tracking <code>[Coins_Remaining, Price]</code>.</p>
+                    <pre><code>// 1. Read the old state (Coins_Remaining)
+read_input_state();
+
+// 2. Subtract the amount the Taker is buying
+PUSH_INT &lt;taker_buy_amount&gt;; // Passed via witness stack
+sub();
+
+// 3. Read the NEW state the Taker is creating at Output 0
+PUSH_INT 0;
+read_output_state();
+
+// 4. Verify the Taker correctly updated the Coins_Remaining state!
+EQUALVERIFY;
+
+// 5. Enforce that the Taker actually paid the Maker for the coins taken
+require_transfer(MAKER_ADDR, &lt;taker_buy_amount&gt; * PRICE);
+true;</code></pre>
+
+                    <p>This simple script creates a fully on-chain, decentralized AMM/Orderbook without any centralized sequencers, gas fees, or re-entrancy vulnerabilities.</p>
+                    
+                    
+                    <h4>Example: Bonding Curve AMM (Algorithmic Pricing)</h4>
+                    <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or adjust prices. State Threads solve this instantly. Here is a fully decentralized <strong>Linear Bonding Curve AMM</strong>, where the 32-byte State tracks the <code>Current_Token_Supply</code>.</p>
+                    <pre><code>// The AMM algorithmic rule: The Price of the next token is equal to Current_Supply.
+
+// 1. Read Current Supply (This acts as our dynamic Price)
+read_input_state(); 
+
+// 2. Verify Payment: Did the user send exactly 'Price' to the Treasury?
+dup();
+sum_to_addr(TREASURY_ADDR);
+EQUALVERIFY;
+
+// 3. Calculate New State: Supply + 1
+PUSH_INT 1;
+add();
+
+// 4. Verify the AMM State was properly updated in Output 0
+PUSH_INT 0;
+read_output_state();
+EQUALVERIFY;
+
+true;</code></pre>
+
+                    <p>This 15-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. The price of the token scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+        <h4>Example: Constant Product AMM (Uniswap X * Y = K)</h4>
+                    <p>Stateless blockchains cannot execute Automated Market Makers (AMMs) because they cannot track reserve balances or calculate slippage. State Threads solve this instantly. Here is a fully decentralized <strong>Constant Product AMM</strong>, where the 32-byte State tracks the token reserves: <code>[Reserve_X, Reserve_Y]</code>.</p>
+                    <pre><code>// 1. Calculate Old K = Old_X * Old_Y
+read_input_state();
+dup(); PUSH_INT 0; PUSH_INT 8; slice(); // Extract Old_X
+swap(); PUSH_INT 8; PUSH_INT 8; slice(); // Extract Old_Y
+mul(); // Old_K
+
+// 2. Calculate New K = New_X * New_Y
+PUSH_INT 0; read_output_state();
+dup(); PUSH_INT 0; PUSH_INT 8; slice(); // Extract New_X
+swap(); PUSH_INT 8; PUSH_INT 8; slice(); // Extract New_Y
+mul(); // New_K
+
+// 3. Enforce X * Y = K (New_K >= Old_K ensures no value is lost)
+swap(); // Stack is now [New_K, Old_K]
+GREATER_OR_EQUAL;
+VERIFY;</code></pre>
+
+                    <p>This 12-line contract demonstrates a fully autonomous, on-chain Automated Market Maker. Because mirstat natively supports integer multiplication and slicing, the contract perfectly calculates the <code>X * Y = K</code> invariant curve. The price scales automatically based purely on supply and demand—without any central sequencers, external price oracles, gas fees, or re-entrancy vulnerabilities.</p>
+                </div>
+                
+                
+                <!-- ── P2PK ──────────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-p2pk">
+                    <h3>Pay-to-Public-Key (P2PK)</h3>
+                    <p>The default script type. The owner's public key is embedded in the locking script. To spend, the owner provides a WOTS+ or MSS signature in the witness.</p>
+                    <pre><code>Script:  PUSH_DATA(&lt;owner_pk&gt;) CHECKSIGVERIFY PUSH_INT(1)
+Witness: [ &lt;signature&gt; ]
+
+Execution Trace:
+1. Stack: [ &lt;signature&gt; ]
+2. PUSH_DATA(&lt;owner_pk&gt;)
+   Stack: [ &lt;signature&gt;, &lt;owner_pk&gt; ]
+3. CHECKSIGVERIFY
+   (Pops pk and sig. Verifies WOTS+/MSS signature against the commitment hash.)
+   Stack: []
+4. PUSH_INT(1)
+   Stack: [ 1 ]
+
+Result: VALID ✓</code></pre>
+
+                    <div class="callout">
+                        <h4>P2SH Addresses</h4>
+                        <p>In practice, wallets hash the entire locking script with BLAKE3 and present only the 32-byte hash as the "address." The sender locks funds to <code>HASH PUSH_DATA(&lt;script_hash&gt;) EQUALVERIFY &lt;script&gt;</code>. This hides the script until spend time, improving privacy and keeping addresses a uniform 32 bytes regardless of script complexity.</p>
+                    </div>
+                </div>
+
+
+
+                <!-- ── MULTI-SIG ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-multisig">
+                    <h3>M-of-N Multi-Signature</h3>
+                    <p>Funds that require multiple independent parties to sign before they can be spent. Useful for joint accounts, exchange cold storage, and escrow. Because the mirstat stack machine executes <code>CHECKSIGVERIFY</code> sequentially, M-of-N is constructed by chaining signature checks — no special opcode needed.</p>
+
+                    <h4>2-of-3 Example</h4>
+                    <p>Alice, Bob, and Carol hold keys. Any two of the three must sign to release funds.</p>
+                    <pre><code>// Locking Script (2-of-3: Alice, Bob, Carol)
+Script:
+  IF
+    PUSH_DATA(&lt;alice_pk&gt;) CHECKSIGVERIFY
+    PUSH_DATA(&lt;bob_pk&gt;)   CHECKSIGVERIFY
+  ELSE
+    PUSH_DATA(&lt;alice_pk&gt;) CHECKSIGVERIFY
+    PUSH_DATA(&lt;carol_pk&gt;) CHECKSIGVERIFY
+  ENDIF
+  PUSH_INT(1)
+
+// Witness for Alice + Bob path:
+Witness: [ &lt;alice_sig&gt;, &lt;bob_sig&gt;, &lt;1&gt; ]   // 1 = take IF branch
+
+// Witness for Alice + Carol path:
+Witness: [ &lt;alice_sig&gt;, &lt;carol_sig&gt;, &lt;0&gt; ]  // 0 = take ELSE branch
+
+Execution Trace (Alice + Bob):
+1. Stack: [ &lt;alice_sig&gt;, &lt;bob_sig&gt;, 1 ]
+2. IF → condition is 1 (true), take IF branch
+   Stack: [ &lt;alice_sig&gt;, &lt;bob_sig&gt; ]
+3. PUSH_DATA(&lt;alice_pk&gt;) CHECKSIGVERIFY
+   (Verifies alice_sig. Pops both.)
+   Stack: [ &lt;bob_sig&gt; ]
+4. PUSH_DATA(&lt;bob_pk&gt;) CHECKSIGVERIFY
+   (Verifies bob_sig. Pops both.)
+   Stack: []
+5. PUSH_INT(1)
+   Stack: [ 1 ]
+
+Result: VALID ✓</code></pre>
+
+                    <div class="callout">
+                        <h4>Key Type Flexibility</h4>
+                        <p>Each signer can independently use WOTS+ one-time keys or MSS reusable keys. A company cold wallet might use MSS (so the address never changes) while individual signers rotate fresh WOTS+ keys for each co-signature. The VM doesn't care — <code>CHECKSIGVERIFY</code> handles both signature types transparently.</p>
+                    </div>
+                </div>
+
+                <!-- ── HTLC ──────────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-htlc">
+                    <h3>Atomic Swaps via Hash Time-Locked Contracts (HTLCs)</h3>
+                    <p>HTLCs enable trustless cross-chain swaps and payment channels. Alice locks funds that can be claimed by Bob <em>only if</em> he reveals a secret preimage within a time window. If Bob doesn't claim in time, Alice gets her funds back.</p>
+
+                    <div class="flow-diagram">
+                        <div class="flow-box"><strong>Alice locks funds</strong><br><span style="color:var(--text-muted); font-size:12px;">Commits to BLAKE3(secret)</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box"><strong>Bob reveals secret</strong><br><span style="color:var(--text-muted); font-size:12px;">Claims within timeout</span></div>
+                        <div class="flow-arrow">→</div>
+                        <div class="flow-box warn"><strong>OR: Timeout expires</strong><br><span style="color:var(--text-muted); font-size:12px;">Alice reclaims funds</span></div>
+                    </div>
+
+                    <pre><code>// Locking Script
+Script:
+  IF
+    HASH
+    PUSH_HEX &lt;secret_hash&gt;    // BLAKE3(secret)
+    EQUALVERIFY
+    PUSH_DATA(&lt;bob_pk&gt;)
+    CHECKSIGVERIFY
+  ELSE
+    DROP
+    PUSH_INT &lt;timeout_height&gt;
+    CHECKTIMEVERIFY
+    PUSH_DATA(&lt;alice_pk&gt;)
+    CHECKSIGVERIFY
+  ENDIF
+  PUSH_INT 1
+
+// Bob claims (knows the secret):
+Witness: [ &lt;bob_sig&gt;, &lt;secret_preimage&gt;, &lt;1&gt; ]
+
+// Alice reclaims after timeout:
+Witness: [ &lt;alice_sig&gt;, &lt;0&gt; ]
+
+Execution Trace (Bob claims):
+1. Stack: [ &lt;bob_sig&gt;, &lt;secret&gt;, 1 ]
+2. IF → take IF branch
+   Stack: [ &lt;bob_sig&gt;, &lt;secret&gt; ]
+3. HASH
+   Stack: [ &lt;bob_sig&gt;, BLAKE3(&lt;secret&gt;) ]
+4. PUSH_HEX &lt;secret_hash&gt;
+   Stack: [ &lt;bob_sig&gt;, BLAKE3(&lt;secret&gt;), &lt;secret_hash&gt; ]
+5. EQUALVERIFY
+   (Checks BLAKE3(secret) == secret_hash. Fails if secret is wrong.)
+   Stack: [ &lt;bob_sig&gt; ]
+6. PUSH_DATA(&lt;bob_pk&gt;) CHECKSIGVERIFY
+   Stack: []
+7. PUSH_INT(1)
+   Stack: [ 1 ]
+
+Result: VALID ✓  Bob receives funds and reveals the secret.</code></pre>
+
+                    <details class="deep-dive">
+                        <summary>Cross-Chain Atomic Swaps</summary>
+                        <div class="dd-content">
+                            <p>Alice wants to swap mirstat coins for coins on another chain. She generates a random secret <code>S</code> and computes <code>H = BLAKE3(S)</code>. She locks her mirstat coins in an HTLC using <code>H</code> as the hash lock, with a 48-hour timeout. Bob simultaneously locks the agreed amount on the other chain using the same <code>H</code> (adapted for that chain's hash function), with a 24-hour timeout.</p>
+                            <p>Bob claims Alice's mirstat coins by revealing <code>S</code>. Alice now sees <code>S</code> on-chain and uses it to claim Bob's coins before his 24-hour timeout expires. If either party abandons the swap, both get their funds back after their respective timeouts. No trusted third party required.</p>
+                        </div>
+                    </details>
+                </div>
+
+                <!-- ── TIMELOCKS ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-timelock">
+                    <h3>Timelocks & Dead Man's Switch</h3>
+                    <p><code>CHECKTIMEVERIFY</code> (CTV) compares a height encoded in the script against the current block height. The script hard-fails if the chain hasn't reached that height yet. This enables inheritance contracts, vesting schedules, and dead man's switches.</p>
+
+                    <h4>Inheritance Contract</h4>
+                    <p>Alice can spend at any time. If she doesn't spend within ~1 year (52,560 blocks), Bob can claim the funds as an heir.</p>
+                    <pre><code>// Locking Script
+Script:
+  IF
+    PUSH_DATA(&lt;alice_pk&gt;)
+    CHECKSIGVERIFY
+  ELSE
+    DROP
+    PUSH_INT &lt;current_height + 52560&gt;
+    CHECKTIMEVERIFY
+    PUSH_DATA(&lt;bob_pk&gt;)
+    CHECKSIGVERIFY
+  ENDIF
+  PUSH_INT 1
+
+// Alice spends normally (any time):
+Witness: [ &lt;alice_sig&gt;, &lt;1&gt; ]
+
+// Bob inherits (after 52,560 blocks):
+Witness: [ &lt;bob_sig&gt;, &lt;0&gt; ]</code></pre>
+
+                    <h4>Vesting Schedule</h4>
+                    <p>A team member's allocation unlocks in tranches. Each UTXO is created with a different <code>CHECKTIMEVERIFY</code> height, so 25% unlocks per year over four years automatically — no central custodian needed.</p>
+                    <pre><code>// Year 1 tranche (locked until height 525,600)
+Script: DROP PUSH_INT 525600 CHECKTIMEVERIFY PUSH_DATA(&lt;team_pk&gt;) CHECKSIGVERIFY PUSH_INT 1
+
+// Year 2 tranche (locked until height 1,051,200)
+Script: DROP PUSH_INT 1051200 CHECKTIMEVERIFY PUSH_DATA(&lt;team_pk&gt;) CHECKSIGVERIFY PUSH_INT 1</code></pre>
+
+                    <h4>Dead Man's Switch</h4>
+                    <p>Funds auto-release to a backup address if the primary key holder goes dark for 6 months (~26,280 blocks). The primary holder simply needs to "refresh" the timelock by spending and re-locking to a new output before the deadline.</p>
+                    <pre><code>Script:
+  IF
+    PUSH_DATA(&lt;primary_pk&gt;)
+    CHECKSIGVERIFY
+  ELSE
+    DROP
+    PUSH_INT &lt;last_seen_height + 26280&gt;
+    CHECKTIMEVERIFY
+    PUSH_DATA(&lt;backup_pk&gt;)
+    CHECKSIGVERIFY
+  ENDIF
+  PUSH_INT 1</code></pre>
+
+                    <div class="callout warn">
+                        <h4>Height vs. Time</h4>
+                        <p>mirstat's <code>CHECKTIMEVERIFY</code> operates on <strong>block height</strong>, not Unix timestamps. At a 60-second target block time, 1 year ≈ 525,600 blocks, 6 months ≈ 262,800 blocks, 1 week ≈ 10,080 blocks. Height-based locks are more predictable than timestamp-based ones since miners cannot trivially manipulate the block height.</p>
+                    </div>
+                </div>
+
+                <!-- ── COVENANTS ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-covenant">
+                    <h3>Covenants via OP_SUM_TO_ADDR</h3>
+
+                    <div class="callout stark">
+                        <h4>The Capability Bitcoin Still Lacks</h4>
+                        <p><code>OP_SUM_TO_ADDR</code> introspects the <em>current transaction's outputs</em> at script execution time. It pops an address from the stack, sums the total value of all outputs in the transaction sent to that address, and pushes the result. This is <strong>output-set awareness</strong> — the ability for a locking script to constrain how the coin can be spent, not just who can spend it. Bitcoin has been debating adding this capability (OP_CTV, OP_CAT) for years. mirstat ships it natively.</p>
+                    </div>
+
+                    <h4>P2P OTC DEX Limit Orders</h4>
+                    <p>Using <code>OP_THIS_ADDRESS</code> and <code>OP_INPUT_VALUE</code>, a Maker can lock MDS on-chain. Takers fill the order by taking the MDS and routing the required remainder back to the covenant address. Order discovery happens entirely over mirstat's ephemeral P2P Chat Bus.</p>
+
+                    <h4>Enforced Donation (Simple Covenant)</h4>
+                    <p>"You can spend this coin, but only if you send at least 100 units to Alice in the same transaction."</p>
+                    <pre><code>Script:
+  PUSH_HEX &lt;alice_addr&gt;
+  SUM_TO_ADDR             // Sums all outputs going to alice_addr in this tx
+  PUSH_INT 100
+  GREATER_OR_EQUAL        // Is the total to Alice >= 100?
+  VERIFY
+  PUSH_DATA &lt;owner_pk&gt;
+  CHECKSIGVERIFY
+  PUSH_INT 1
+
+Execution Trace (owner spends, sending 150 to Alice):
+1. Stack: []
+2. PUSH_HEX &lt;alice_addr&gt;
+   Stack: [ &lt;alice_addr&gt; ]
+3. SUM_TO_ADDR
+   (Introspects tx outputs. Finds 150 units going to alice_addr.)
+   Stack: [ 150 ]
+4. PUSH_INT 100
+   Stack: [ 150, 100 ]
+5. GREATER_OR_EQUAL
+   Stack: [ 1 ]  // 150 >= 100 → true
+6. VERIFY
+   Stack: []
+7. PUSH_DATA &lt;owner_pk&gt; CHECKSIGVERIFY
+   Stack: []
+8. PUSH_INT 1
+   Stack: [ 1 ]
+
+Result: VALID ✓
+
+// If owner tries to spend without sending to Alice:
+// Step 3 returns 0. GREATER_OR_EQUAL → 0. VERIFY → FAIL ✗</code></pre>
+
+                    <h4>Percentage-Based Covenant</h4>
+                    <p>Enforce that at least 10% of any spend goes to a community fund — useful for protocol treasuries, royalties, or charitable commitments baked into a UTXO at creation time.</p>
+                    <pre><code>// Suppose the coin has value V. Owner must route at least V/10 to the fund.
+// Since we can't divide on-stack, the wallet constructs outputs such that
+// fund_output >= total_input / 10. The script verifies the absolute amount:
+
+Script:
+  PUSH_HEX &lt;fund_addr&gt;
+  SUM_TO_ADDR
+  PUSH_INT &lt;minimum_fund_amount&gt;   // computed off-chain by wallet: input_value / 10
+  GREATER_OR_EQUAL
+  VERIFY
+  PUSH_DATA &lt;owner_pk&gt;
+  CHECKSIGVERIFY
+  PUSH_INT 1</code></pre>
+                </div>
+
+                <!-- ── OPCODE REF ─────────────────────────────────────────────────── -->
+                <div class="tab-content" id="vm-opcodes">
+                    <h3>Writing & Compiling mirstat Stack Machine Bytecode</h3>
+                    <p>mirstat Stack Machine Code assembly files use the <code>.msc</code> extension. Compile them with the CLI:</p>
+                    <div class="terminal">
+                        $ mirstat wallet compile --file my_script.msc<br>
+                        <span class="term-success">SUCCESS</span> Compiled to 48 bytes. P2SH address: 9f3a...c12b
+                    </div>
+
+                    <h4>Stack Opcodes</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>PUSH_INT &lt;n&gt;</code></td><td>→ n</td><td>Push integer literal</td></tr>
+                            <tr><td><code>PUSH_HEX &lt;hex&gt;</code></td><td>→ bytes</td><td>Push raw bytes from hex string</td></tr>
+                            <tr><td><code>PUSH_DATA &lt;data&gt;</code></td><td>→ data</td><td>Push data blob (pk, address, etc.)</td></tr>
+                            <tr><td><code>DROP</code></td><td>x →</td><td>Discard top item</td></tr>
+                            <tr><td><code>DUP</code></td><td>x → x x</td><td>Duplicate top item</td></tr>
+                            <tr><td><code>SWAP</code></td><td>a b → b a</td><td>Swap top two items</td></tr>
+                            <tr><td><code>OVER</code></td><td>a b → a b a</td><td>Copy second-to-top item to top</td></tr>
+                            <tr><td><code>ROT</code></td><td>a b c → b c a</td><td>Rotate top three items</td></tr>
+                            <tr><td><code>PICK</code></td><td>n → nth</td><td>Copy the nth item to the top</td></tr>
+                            <tr><td><code>SIZE</code></td><td>x → x size</td><td>Push byte size of top item</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Arithmetic & Logic</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>ADD</code></td><td>a b → a+b</td><td>Integer addition</td></tr>
+                            <tr><td><code>SUB</code></td><td>a b → a-b</td><td>Integer subtraction (fails on underflow)</td></tr>
+                            <tr><td><code>MUL</code></td><td>a b → a*b</td><td>Integer multiplication</td></tr>
+                            <tr><td><code>DIV</code></td><td>a b → a/b</td><td>Integer division</td></tr>
+                            <tr><td><code>MOD</code></td><td>a b → a%b</td><td>Integer modulo</td></tr>
+                            <tr><td><code>EQUAL</code></td><td>a b → bool</td><td>Push 1 if equal, 0 otherwise</td></tr>
+                            <tr><td><code>EQUALVERIFY</code></td><td>a b →</td><td>Fail if not equal, else pop both</td></tr>
+                            <tr><td><code>GREATER_OR_EQUAL</code></td><td>a b → bool</td><td>Push 1 if a &gt;= b</td></tr>
+                            <tr><td><code>VERIFY</code></td><td>x →</td><td>Fail if top is not 1</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Bytes & Data</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>SLICE</code></td><td>data off len → slice</td><td>Extracts a substring of bytes.</td></tr>
+                            <tr><td><code>CONCAT</code></td><td>a b → ab</td><td>Concatenates two byte arrays.</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Control Flow</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>IF</code></td><td>Pops top item. Executes IF block if 1, ELSE block if 0.</td></tr>
+                            <tr><td><code>ELSE</code></td><td>Alternate branch of IF.</td></tr>
+                            <tr><td><code>ENDIF</code></td><td>Closes IF/ELSE block.</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Cryptographic Opcodes</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>HASH</code></td><td>data → BLAKE3(data)</td><td>BLAKE3 hash of top item</td></tr>
+                            <tr><td><code>CHECKSIG</code></td><td>sig pk → bool</td><td>Verify WOTS+/MSS signature. Push result.</td></tr>
+                            <tr><td><code>CHECKSIGVERIFY</code></td><td>sig pk →</td><td>Verify signature. Fail if invalid.</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Introspection & Covenants</h4>
+                    <table>
+                        <thead><tr><th>Mnemonic</th><th>Stack Effect</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>CHECKTIMEVERIFY</code></td><td>height →</td><td>Fail if chain height &lt; height. Pop height.</td></tr>
+                            <tr><td><code>SUM_TO_ADDR</code></td><td>addr → amount</td><td>Sum all output values in this tx sent to addr. Push total.</td></tr>
+                            <tr><td><code>READ_INPUT_STATE</code></td><td>→ state</td><td>Push the 32-byte state of the current input (v3).</td></tr>
+                            <tr><td><code>READ_OUTPUT_STATE</code></td><td>index → state</td><td>Push the 32-byte state of the output at 'index' (v3).</td></tr>
+                            <tr><td><code>INPUT_VALUE</code></td><td>→ value</td><td>Push value of the executing input coin (v4).</td></tr>
+                            <tr><td><code>OUTPUT_ADDRESS</code></td><td>index → addr</td><td>Push address of the output at 'index' (v5).</td></tr>
+                            <tr><td><code>THIS_ADDRESS</code></td><td>→ addr</td><td>Push the 32-byte address of the executing script (v5).</td></tr>
+                        </tbody>
+                    </table>
+
+                    <div class="callout warn">
+                        <h4>The Clean Stack Rule</h4>
+                        <p>Every valid script execution must leave <strong>exactly one item</strong> on the stack at termination, and it must be <code>[1]</code>. A script that leaves <code>[1, 1]</code> or terminates with an empty stack both fail. This prevents scripts from accidentally succeeding due to leftover garbage values and makes script behavior unambiguous.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── mirstatAXE HARDWARE ── -->
+        <div class="content-pane" id="axe-hw">
+            <h2>The mirstatAxe Ecosystem</h2>
+            <p>The mirstat node is highly optimized for the <strong>mirstatAxe</strong>—a custom OS image built via Buildroot for Raspberry Pi hardware (Zero 2 W, Pi 3, Pi 4). The node exposes exclusive hardware APIs when it detects the physical device.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Memory Footprint</div>
+                    <div class="stat-value">< 150 MB</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Jemalloc</div>
+                    <div class="stat-value">Anti-Fragmentation</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">OS Environment</div>
+                    <div class="stat-value">Embedded Linux</div>
+                </div>
+            </div>
+
+            <h3>Hardware APIs</h3>
+            <p>When the node detects it is running on Axe hardware (via device tree inspection), it unlocks a suite of captive-portal and management endpoints over the Axum RPC server:</p>
+            
+            <ul>
+                <li><code>/axe/stats</code>: Reads the CPU's thermal zone (in milli-Celsius), system uptime, and fetches the real-time atomic hardware hashrate counter.</li>
+                <li><code>/axe/wifi</code>: Acts as a captive portal, allowing users to configure <code>wpa_supplicant.conf</code> and reload the <code>wlan0</code> interface live via <code>wpa_cli</code>.</li>
+                <li><code>/axe/overclock</code>: Safely modifies <code>/boot/config.txt</code> to adjust <code>arm_freq</code> and <code>over_voltage</code>, then orchestrates a system reboot.</li>
+                <li><code>/axe/rewards</code>: Serves the <code>coinbase_seeds.jsonl</code> file directly to the user so they can import their offline mined rewards into a standard Desktop wallet.</li>
+            </ul>
+
+            <div class="callout warn">
+                <h4>DataBurn UTXOs (OP_RETURN)</h4>
+                <p>The mirstatAxe nodes are protected from state bloat. Users can embed arbitrary data in the blockchain using <code>OutputData::DataBurn</code> (capped at 80 bytes). However, these outputs yield no <code>coin_id</code> and are <strong>completely ignored by the UTXO Sparse Merkle Tree</strong>. Miners process the data, but the RAM of edge devices is never burdened by tracking unspendable data.</p>
+            </div>
+        </div>
+
+        <!-- ── ADVERSARIAL ANALYSIS ── -->
+        <div class="content-pane" id="adversarial">
+            <h2>Adversarial Analysis & Edge Cases</h2>
+            <p>A protocol is only as robust as its worst-case scenario. mirstat was designed with strict mathematical bounds to survive hostility, spam, and hardware constraints without relying on benevolent actor assumptions.</p>
+
+            <div class="tabs">
+                <div class="tab-nav">
+                    <button class="tab-btn active" data-tab="spam-proof">Mempool DoS & Dynamic PoW</button>
+                    <button class="tab-btn" data-tab="frag-proof">UTXO Fragmentation Bound</button>
+                    <button class="tab-btn" data-tab="smt-proof">OOM Defense (SMT Limits)</button>
+                </div>
+
+                <div class="tab-content active" id="spam-proof">
+                    <h3>Mempool DoS & Dynamic PoW</h3>
+                    <p><strong>The Threat:</strong> In mirstat's 2-phase mempool, the <em>Commit</em> phase does not require a fee (fees are paid during the <em>Reveal</em>). An attacker could attempt to exhaust node RAM by flooding the network with millions of fake commitments.</p>
+                    
+                    <p><strong>The Mathematical Defense:</strong> mirstat enforces a dynamic Proof-of-Work spam nonce that scales exponentially based on mempool congestion. The target is defined by the number of leading zero bits required in the hash: <code>BLAKE3(commitment || nonce)</code>.</p>
+                    
+                    <ul>
+                        <li><strong>&lt; 500 pending commits:</strong> 24 bits (~16.7 million hashes)</li>
+                        <li><strong>500 - 749 pending commits:</strong> 26 bits (~67.1 million hashes)</li>
+                        <li><strong>750 - 899 pending commits:</strong> 28 bits (~268.4 million hashes)</li>
+                        <li><strong>&gt; 900 pending commits:</strong> 30 bits (~1.07 billion hashes)</li>
+                    </ul>
+
+                    <div class="callout warn">
+                        <h4>Attacker Bankruptcy</h4>
+                        <p>If an attacker wants to hold 1,000 garbage commits in the mempool to degrade network performance, the cost per transaction becomes ~1.07 billion hashes. To sustain a flood of 100 tx/sec at this congestion level, the attacker must sustain <strong>107 Billion hashes per second</strong>—all while legitimate users easily bypass the spam by submitting a single transaction taking ~1 second on a standard laptop. The attacker burns immense CPU power, while the node uses just kilobytes of RAM.</p>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="frag-proof">
+                    <h3>UTXO Fragmentation Bound (The Greedy Snowball)</h3>
+                    <p><strong>The Threat:</strong> By forcing all UTXOs to be strict powers of 2 (for privacy), a transaction of value <code>1,023</code> requires 10 distinct UTXOs (512+256+128+64+32+16+8+4+2+1). Critics argue this will cause the global UTXO set to fracture infinitely into "dust," bloating the state.</p>
+
+                    <p><strong>The Mathematical Defense:</strong> The mirstat wallet implements a <em>Greedy Snowball Defragmentation</em> algorithm. It mathematically guarantees that a user's wallet fragmentation is strictly bounded to <code>O(log₂ V)</code>, where <code>V</code> is their total balance.</p>
+
+                    <div class="math-block">
+                        // The Greedy Snowball Algorithm<br>
+                        1. Select minimum coins needed to satisfy payment.<br>
+                        2. Calculate resulting change denominations.<br>
+                        3. IF wallet contains a live coin matching a change denomination:<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;Pull that coin into the transaction inputs.<br>
+                        &nbsp;&nbsp;&nbsp;&nbsp;GOTO 2 (Merge up to the next power of 2).
+                    </div>
+
+                    <p><strong>Proof by Example:</strong> You need to pay <code>6</code>. Your wallet contains <code>[8, 2, 2]</code>.<br>
+                    - Normal selection picks <code>8</code>. Change is <code>2</code>. Wallet becomes <code>[2, 2, 2]</code> (Fragmentation worsened).<br>
+                    - <strong>Greedy selection</strong> picks <code>8</code>. Sees change is <code>2</code>. Pulls in an existing <code>2</code>. Total input <code>10</code>. Change is <code>4</code>. Wallet becomes <code>[4, 2]</code> (Defragmented!). Every transaction actively cleans the global UTXO set.</p>
+                </div>
+
+                <div class="tab-content" id="smt-proof">
+                    <h3>OOM Defense: SMT Memory Bounding</h3>
+                    <p><strong>The Threat:</strong> Bitcoin relies on an unbounded LevelDB database for its chainstate. As the network grows to billions of UTXOs, edge devices (like Raspberry Pis) will inevitably suffer Out-Of-Memory (OOM) panics or fatal disk I/O bottlenecks.</p>
+
+                    <p><strong>The Mathematical Defense:</strong> mirstat replaces the unbounded database with a 256-level Sparse Merkle Tree (SMT). We mathematically guarantee that the node's RAM requirements will never exceed a fixed threshold, regardless of how many UTXOs exist.</p>
+
+                    <div class="callout stark">
+                        <h4>The Cache Boundary Theorem</h4>
+                        <p>A full 256-level binary tree contains ~10<sup>77</sup> nodes, which is impossible to store. mirstat truncates memory allocation exactly at <code>CACHE_MIN_HEIGHT = 240</code>.</p>
+                        <p>The top 16 levels of the tree are cached in RAM. <code>2^16 = 65,536</code> maximum possible nodes. At 32 bytes per node hash, the absolute maximum memory footprint for the entire global state root index is exactly <strong>2.09 MB</strong>. The bottom 240 levels are never stored; they are dynamically folded in <code>O(log N)</code> time using a binary search over bucketed UTXOs on disk. The node cannot be OOM-crashed by state bloat, period.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── COMPARISON ── -->
+        <div class="content-pane" id="vs-legacy">
+            <h2>Architecture Comparison</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Subsystem</th>
+                        <th>Legacy Chains</th>
+                        <th>mirstat</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Cryptography</strong></td>
+                        <td>Elliptic Curve (Shor vulnerable)</td>
+                        <td class="hl">BLAKE3, WOTS+, MSS</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Mining Hardware</strong></td>
+                        <td>Parallel ASICs / GPUs</td>
+                        <td class="hl">Sequential Hashing (CPUs)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Transaction Ordering</strong></td>
+                        <td>Cleartext Bidding (MEV)</td>
+                        <td class="hl">2-Phase Commit-Reveal</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Value Privacy</strong></td>
+                        <td>Public cleartext ledgers</td>
+                        <td class="hl">Power-of-2 UTXOs & Coinjoin </td>
+                    </tr>
+                    <tr>
+                        <td><strong>State Storage</strong></td>
+                        <td>Unbounded UTXO LevelDB</td>
+                        <td class="hl">Pruned Sparse Merkle Tree</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Difficulty Target</strong></td>
+                        <td>Sliding-window average</td>
+                        <td class="hl">ASERT (16.16 Fixed Point)</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+
+        <!-- ── ROADMAP ── -->
+        <div class="content-pane" id="roadmap">
+            <h2>Roadmap</h2>
+
+            <p>Before a coin is real, three things have to be true: the chain has to run, people have to mine it, and it has to trade. mirstat does all three. The chain is live, people mine it — including on a Raspberry Pi 5 — and it is listed on SafeTrade, so it trades against real money.</p>
+
+            <p>What follows is the whole build, in one ledger, with nothing hidden. Most of it is already shipped. The parts that are not are stated plainly, because that is where the remaining work is.</p>
+
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Shipped</div>
+                    <div class="stat-value">28</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">In progress</div>
+                    <div class="stat-value">2</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Planned</div>
+                    <div class="stat-value">9</div>
+                </div>
+            </div>
+
+            <div class="rm-legend">
+                <span><i class="rm-key done"></i> SHIPPED — running today</span>
+                <span><i class="rm-key wip"></i> BUILDING — actively in hand</span>
+                <span><i class="rm-key next"></i> PLANNED — not started</span>
+            </div>
+
+            <div class="callout stark">
+                <h4>The short version</h4>
+                <p>The hard parts are done. Post-quantum signatures, the covenant VM, mining on commodity hardware, payment channels, routing, and trustless cross-chain swaps all work today. What is left is turning a set of working parts into a payment network, and getting more than one person building on it.</p>
+            </div>
+
+            <h3>Chain &amp; consensus</h3>
+            <div class="rm-group">
+                <h4>Layer 1 <span class="rm-tally">9 shipped</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Sequential BLAKE3 proof-of-work</span>
+                        <div class="rm-note">One million sequential compression cycles per header. Simple, verifiable against a single scalar implementation, and hostile to parallel ASICs.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Post-quantum signatures</span>
+                        <div class="rm-note">WOTS one-time keys with Merkle signature trees. No elliptic curves anywhere in the protocol.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Two-phase transactions</span>
+                        <div class="rm-note">Commit then reveal, so a one-time key is never exposed while a transaction is still spendable by anyone else.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Uniform power-of-two denominations</span>
+                        <div class="rm-note">Every output is a power of two, which removes the amount as a linking heuristic for chain surveillance.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Stateful covenant VM</span>
+                        <div class="rm-note">A script reads the state committed on the coin it spends and the coin it creates, and enforces the relation between them. That is enough for a real on-chain state machine — a vote tally, a staking pool, a treasury — inside a deliberately non-Turing-complete VM.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Compact block filters &amp; light-client sync</span>
+                        <div class="rm-note">A client scans for its own coins and verifies what it finds, without ever trusting a server to report its balance.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Adaptive finality</span>
+                        <div class="rm-note">Confirmation depth is not a fixed number. The node observes how the chain is actually behaving and raises the depth it treats as safe when it sees adversarial conditions, lowering it again when the chain is honest.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Proof-of-work governor on public RPC</span>
+                        <div class="rm-note">A public node cannot be drained by whoever shows up. Each caller gets a free allowance that covers normal browsing; past it the price is paid in proof-of-work, escalating per IP and capped so it never becomes a lockout.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">CoinJoin mixing</span>
+                        <div class="rm-note">Collaborative transactions with a separate fee donor, sized against the same fee rule the mempool enforces.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Mining</h3>
+            <div class="rm-group">
+                <h4>Hashing &amp; pools <span class="rm-tally">3 shipped · 1 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">8-way NEON SIMD miner</span>
+                        <div class="rm-note">A Raspberry Pi 5 does roughly 100 nonces per second. Against a GPU farm that is a gap of about 1 to 5,000 — compared with 1 to 1.2 billion for a hobbyist on Bitcoin. The hardware advantage is trapped in the commodity silicon band on purpose.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">GPU miner with CPU re-verification</span>
+                        <div class="rm-note">The graphics card is treated as an untrusted oracle; every chain it returns is re-verified on the CPU before anything is broadcast.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Provably fair pool, 0% fee</span>
+                        <div class="rm-note">A Merkle tree of every miner's score is committed into each block's coinbase. A miner can pull a proof that their exact score was included <em>before</em> they start hashing, and disconnect if the operator lies. Non-custodial — payouts go straight to the coinbase, so the pool never holds your coins.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Mining inside the desktop wallet</span>
+                        <div class="rm-note">One download that syncs, holds your coins, and mines them. The miners exist; wrapping them in the GUI does not.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Q-Bolt — Layer 2</h3>
+            <p>Q-Bolt is Spilman channels. Two parties fund a 2-of-2 multisig UTXO; the sender signs balance states and hands them over, and the receiver signs nothing until the channel closes. Only two transactions ever touch the chain. Because the money moves one way, the receiver's balance can only ratchet up — so there is no revocation, no penalty transactions, and no "punish the cheater" machinery. The attack those mechanisms defend against is structurally impossible here.</p>
+
+            <div class="rm-group">
+                <h4>Channels &amp; routing <span class="rm-tally">6 shipped · 1 building · 3 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Funded channels</span>
+                        <div class="rm-note">Open, update off-chain without limit, close cooperatively in a single transaction. Time-locked refund as the unilateral exit.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">HTLCs &amp; multi-hop routing</span>
+                        <div class="rm-note">Payments cross several channels under a single preimage. A hub cannot take one hop without releasing the next.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Covenant HTLCs — zero-signature claim</span>
+                        <div class="rm-note">The script forces the coin to the right place, so the redeemer only reveals the preimage. On a chain where every signature is a 576-byte one-time key, a claim path that spends no keys is worth having.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Just-in-time channel opening</span>
+                        <div class="rm-note">A hub can pay a destination it has no channel to yet by funding one on demand.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Invoices</span>
+                        <div class="rm-note">Minted and signed over the chat bus, then paid automatically.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Hub policy &amp; capacity budgets</span>
+                        <div class="rm-note">Accept incoming channels, forward for a flat 50-unit fee, open on request, and cap both per-channel and total committed capacity so a stream of individually reasonable requests cannot drain a wallet.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item wip">
+                    <div class="rm-status">[ BUILDING ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Persistent, routable channels</span>
+                        <div class="rm-note">This is the one that unblocks everything else. Today's channels are one-directional and disposable, so the channel you need often is not there and payments fall back on-chain. Whether the answer ends up bidirectional or something else is an implementation detail — the target is fixed, the shape is not.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Delegated close</span>
+                        <div class="rm-note">Not a watchtower — there is no fraud to watch for. Because the sender never holds the receiver's signature, no old state can be broadcast, so revocation and penalty machinery are unnecessary. What remains is a deadline: a receiver has to close before the sender's refund unlocks. A delegate holding a pre-signed close covers that while you are offline, and because the receiver's balance only ratchets up, a delegate running a state or two behind closes you slightly short rather than putting anything at risk. The gossip layer and peer reputation to find delegates already exist.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Splicing &amp; refill</span>
+                        <div class="rm-note">Top up a drained channel instead of closing and reopening it on-chain.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Liquidity-aware pathfinding</span>
+                        <div class="rm-note">Route across many hubs by picking paths that can actually carry the payment.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout">
+                <h4>The measure of success</h4>
+                <p>A payment confirms instantly, costs almost nothing, and the network can carry a lot of them at once. Everything in this section serves that and nothing else. It needs no new cryptographic assumption and no script feature the chain does not already have — the primitives are in the VM. The work is making them into a payment network.</p>
+            </div>
+
+            <h3>Cross-chain DEX</h3>
+            <p>Selling MDS for ETH on Base is a hash-time-locked swap. You lock MDS in a covenant under <code>H = BLAKE3(secret)</code> with an absolute refund height; the buyer verifies it and locks ETH under the same <code>H</code> with a shorter refund delay; you claim the ETH by revealing the secret on Base; the buyer reads it and claims your MDS. Either both legs complete or both refund, with no intermediary.</p>
+
+            <div class="callout warn">
+                <h4>Doesn't publishing the secret let anyone steal the coins?</h4>
+                <p>No, and this is the whole trick. The secret is not a key to the money — it is one of two conditions on each lock. The other is a fixed recipient, baked in when the lock was made: the MDS lock pays the buyer, the ETH lock pays you, no matter who reveals the secret. A bot that races to claim first only pays gas to send you your own ETH. Revealing the secret is not a leak; it is how the swap settles.</p>
+            </div>
+
+            <div class="rm-group">
+                <h4>Trading <span class="rm-tally">4 shipped · 1 building</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Atomic swaps against Base, both directions</span>
+                        <div class="rm-note">Live and working on-chain today, buying and selling.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">On-chain limit orders with partial fills</span>
+                        <div class="rm-note">An order is split into power-of-two units, each with its own secret and its own price share, so a buyer can take part of one without the maker reposting the remainder. The coins funding the order and the announcement describing it commit in the same transaction, so nobody can advertise liquidity that was never funded.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Submarine swap rail</span>
+                        <div class="rm-note">The MDS leg settles in a channel instead of on-chain while the ETH leg settles on Base, under the same preimage. Minutes of block confirmations collapse into one instant channel update. Now the default rail in the desktop wallet, with on-chain as the fallback.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Trade tab in the desktop wallet</span>
+                        <div class="rm-note">The order book, unit-level fills, live swap state and the rail selector are a first-class tab, not a hidden feature.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item wip">
+                    <div class="rm-status">[ BUILDING ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Fast path available every time</span>
+                        <div class="rm-note">The submarine rail only works when a channel already exists in the right direction with enough balance. Making that always true is the same job as persistent, routable channels above — the DEX is not blocked on inventing Layer 2, it is blocked on finishing it.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Wallets &amp; clients</h3>
+            <div class="rm-group">
+                <h4>How people hold MDS <span class="rm-tally">5 shipped</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Desktop GUI wallet</span>
+                        <div class="rm-note">A full-node wallet with send, receive, coins, history, channels, chat, trade, node status and guided onboarding. No command line and no browser tab.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Browser wallet — live now</span>
+                        <div class="rm-note">Genuinely a light node, not a hosted account: it reaches full nodes over WebRTC direct with no server, no domain and no certificate authority, scans with compact block filters, verifies what it finds, and can solo-mine in a WASM worker per core. It installs as a PWA and works offline. Its one real limitation is that it tracks the chain rather than holding it — if the chain reorganises under it, it can fall out of step and need a rescan. Use it when you want a wallet in thirty seconds; use a full node when it matters.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Command-line wallet &amp; full node</span>
+                        <div class="rm-note">For people who live in a terminal.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Block explorer</span>
+                        <div class="rm-note">Batches, reveals, and analytics, including channel opens and cooperative closes as they settle.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Peer-to-peer chat network</span>
+                        <div class="rm-note">Carries channel negotiation, invoices and hub discovery, and charges proof-of-work per message — which makes it both the natural place to look and a poor place to spam.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout stark">
+                <h4>Which one should you run?</h4>
+                <p><strong>The desktop wallet, if you can.</strong> It is a full node, so it verifies the chain itself instead of asking anyone. Nothing can tell it a balance it has not checked, and it cannot drift out of step with the chain the way a light client can — it <em>is</em> the chain.</p>
+                <p>The part that is easy to miss: running one is not only for your benefit. Every full node is somewhere else the network can be reached, another copy of the history, and another peer a light client can sync against. A network of light clients pointed at a handful of nodes is a network with a handful of points of failure. The web wallet is the fastest way in and it works — but the full node is the one that makes the network harder to switch off.</p>
+            </div>
+
+            <h3>Building on mirstat</h3>
+
+            <div class="callout stark">
+                <h4>The actual problem</h4>
+                <p>People use mirstat. They mine it, swap it, trade it. Almost nobody builds on it. That is what holds the project back — not the protocol, which is further along than the community realises. What is missing is other people making things: contracts, tokens, tools, apps. Right now that is mostly one socially awkward person, and one person is not a development community.</p>
+            </div>
+
+            <div class="rm-group">
+                <h4>Developer surface <span class="rm-tally">1 shipped · 5 planned</span></h4>
+
+                <div class="rm-item done">
+                    <div class="rm-status">[ SHIPPED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Midscript IDE</span>
+                        <div class="rm-note">A real language rather than hand-written stack opcodes: <code>let</code> and <code>var</code>, <code>if</code>, <code>repeat</code>, <code>switch</code>, user-defined macros, named <code>struct</code> and <code>state</code> layouts so you address committed state by name instead of slicing bytes. Ships a standard library of the primitives covenants actually need, a debugger that steps the compiled bytecode against a live stack, an emulator, and wallet connect — blank editor to deployed script without leaving the page.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">Tokens on-chain</span>
+                        <div class="rm-note">Not because the world needs another memecoin, but because it proves the chain carries assets other than MDS.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">An AMM for those tokens</span>
+                        <div class="rm-note">Uniswap-style, trading against MDS. Workable on the main chain today; the point of doing it on Layer 2 is that it becomes instant.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">JavaScript SDK brought up to the protocol</span>
+                        <div class="rm-note">The published SDK is behind: it does not handle reorgs, it misses consolidate outputs, and its Layer 2 support is a stub. Exactly the kind of contribution the project needs.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">On-chain competitions</span>
+                        <div class="rm-note">Prize money should not have to sit in my wallet on trust. Where a bounty has an objective test, a covenant can escrow the prize and release it automatically to whoever first meets the condition — no judge, no trust. Where "best" is a human call, the same escrow releases on a governance vote. Either way the rules are visible on-chain, which is itself the kind of contract the competition is asking people to write.</div>
+                    </div>
+                </div>
+
+                <div class="rm-item next">
+                    <div class="rm-status">[ PLANNED ]</div>
+                    <div class="rm-body">
+                        <span class="rm-title">A foundation, possibly a DAO in mirstat script</span>
+                        <div class="rm-note">The IDE already ships a staking-and-governance contract that compiles to bytecode today, with named state fields, stake-weighted voting, thresholds and enforced treasury payments. Running it for real would be the project governing itself on its own chain — the strongest demonstration there is that mirstat carries real applications.</div>
+                    </div>
+                </div>
+            </div>
+
+            <h3>Near term</h3>
+            <p>Finish Layer 2. Make the submarine rail available every time rather than only when liquidity happened to be pre-positioned. Add tokens and an AMM on top of it. Keep pushing on getting people building instead of only using.</p>
+
+            <div class="callout">
+                <h4>If you want to help</h4>
+                <p>The chain works, it trades, and it is cheap to experiment on. Start at the <a href="./ide.html" target="_blank">Midscript IDE</a> — templates, an emulator and a debugger are all in the page. If you would rather work on the client side, the SDK and the Layer 2 tooling are wide open. If mirstat grows, it grows because more people build on it than just me. That is not a complaint; it is the one thing I cannot do alone.</p>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script type="module">
+    // 1. Import Mermaid
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    
+    // 2. Initialize WITHOUT auto-loading
+    mermaid.initialize({ 
+        startOnLoad: false, 
+        theme: 'dark', 
+        fontFamily: "'JetBrains Mono', monospace" 
+    });
+
+    // --- Theme Toggling --- //
+    const themeBtn = document.getElementById('theme-btn');
+    const html = document.documentElement;
+
+    function setTheme(theme) {
+        html.setAttribute('data-theme', theme);
+        localStorage.setItem('mirstat-theme', theme);
+    }
+
+    const savedTheme = localStorage.getItem('mirstat-theme');
+    if (savedTheme) {
+        setTheme(savedTheme);
+    } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+        setTheme('light');
+    } else {
+        setTheme('dark');
+    }
+
+    themeBtn.addEventListener('click', () => {
+        const current = html.getAttribute('data-theme');
+        setTheme(current === 'dark' ? 'light' : 'dark');
+    });
+
+// --- Mobile Hamburger Menu --- //
+    const sidebar = document.getElementById('sidebar-menu');
+    const mobileBtn = document.getElementById('mobile-menu-btn');
+    const closeBtn = document.getElementById('mobile-close-btn');
+
+    mobileBtn.addEventListener('click', () => sidebar.classList.add('open'));
+    closeBtn.addEventListener('click', () => sidebar.classList.remove('open'));
+    
+
+
+    // --- Boot Sequence Animation --- //
+    const curtain = document.getElementById('curtain');
+    if (curtain && curtain.style.display !== 'none') {
+        const BTC_HASH = "000000000000000000018f5ad5625d43356136c2e50c6dc18967a90a18f0af2e";
+        const INSCRIPTION = [
+            "Harvest Now, Decrypt Later: The ",
+            "Quantum Era's Encryption Challen",
+            "ge (Published Feb 24, 2026, by R",
+            "BC Disruptors)",
+        ];
+        const GENESIS = "0005affb94998de09c1a72d0105c053aedf0d2ccbd4981eb27f6e8500507baa0";
+        const HEX = "0123456789abcdef";
+        const rnd = () => HEX[(Math.random() * 16) | 0];
+
+        const T = {
+            act1In:        60,
+            btcCharEvery:  9,
+            act1Hold:      260,
+            act2In:        1080,
+            inscCharEvery: 6,
+            act2Hold:      240,
+            mutate:        420,
+            crush:         300,
+            counter:       520,
+            zeroEvery:     190,
+            foldIn:        220,
+            foldEvery:     165,
+            resolve:       420,
+            hold:          420,
+            lift:          420,
+        };
+
+        let speed = 1;
+        const ms = v => v * speed;
+        let timers = [];
+        const at = (t, fn) => timers.push(setTimeout(fn, ms(t)));
+        const clearAll = () => { timers.forEach(clearTimeout); timers = []; };
+
+        const $ = id => document.getElementById(id);
+
+        function spans(str, faintLeadingZeros) {
+            const lead = faintLeadingZeros ? (str.match(/^0+/) || [''])[0].length : 0;
+            return [...str].map((c, i) =>
+                `<span class="${i < lead ? 'faint' : ''}">${c}</span>`).join('');
+        }
+
+        function typeInto(el, str, every, faint, done) {
+            let i = 0;
+            (function step() {
+                el.innerHTML = spans(str.slice(0, i), faint);
+                if (i++ < str.length) timers.push(setTimeout(step, ms(every)));
+                else if (done) done();
+            })();
+        }
+
+        function runBootSequence() {
+            clearAll();
+            curtain.classList.remove('lifting', 'gone');
+            ['act1','act23'].forEach(id => $(id).classList.remove('on'));
+            const g0 = $('block');
+            g0.className = 'grid';
+            g0.style.fontSize = '';
+            g0.style.letterSpacing = '';
+            $('btcHash').innerHTML = '';
+            $('block').innerHTML = '';
+            $('cap23').textContent = '';
+            $('boot-logo').classList.remove('on');
+            $('skip').classList.remove('on');
+
+            at(600, () => $('skip').classList.add('on'));
+
+            at(T.act1In, () => {
+                $('act1').classList.add('on');
+                typeInto($('btcHash'), BTC_HASH, T.btcCharEvery, true);
+            });
+
+            const act1End = T.act1In + BTC_HASH.length * T.btcCharEvery + T.act1Hold;
+            at(act1End, () => $('act1').classList.remove('on'));
+
+            const a2 = act1End + 240;
+            at(a2, () => {
+                $('act23').classList.add('on');
+                $('cap23').textContent = 'Genesis inscription · 4 × 32 bytes · provably unspendable';
+
+                const full = INSCRIPTION.join('\n');
+                let i = 0;
+                (function step() {
+                    const shown = full.slice(0, i);
+                    $('block').innerHTML = shown.split('\n')
+                        .map(r => `<div class="row">${r.replace(/ /g, '&nbsp;')}</div>`).join('');
+                    if (i++ < full.length) timers.push(setTimeout(step, ms(T.inscCharEvery)));
+                })();
+            });
+
+            const inscLen = INSCRIPTION.join('\n').length;
+            const a3 = a2 + inscLen * T.inscCharEvery + T.act2Hold;
+
+            at(a3, () => {
+                $('cap23').textContent = 'Hashing · BLAKE3';
+                const rows = [...$('block').querySelectorAll('.row')];
+                const cells = rows.map(r => [...r.textContent]);
+                const total = cells.reduce((n, r) => n + r.length, 0);
+                let done = 0;
+
+                const iv = setInterval(() => {
+                    for (let k = 0; k < 14; k++) {
+                        const ri = (Math.random() * cells.length) | 0;
+                        const ci = (Math.random() * cells[ri].length) | 0;
+                        if (cells[ri][ci] !== '\u0000') { cells[ri][ci] = rnd(); done++; }
+                    }
+                    rows.forEach((r, i) => r.textContent = cells[i].join(''));
+                    if (done > total * 1.6) clearInterval(iv);
+                }, ms(22));
+                timers.push(iv);
+            });
+
+            const crushAt = a3 + T.mutate;
+            at(crushAt, () => {
+                $('block').classList.add('crushed');
+                [...$('block').querySelectorAll('.row')].forEach((r, i) => {
+                    if (i > 0) r.style.opacity = '0';
+                });
+            });
+
+            at(crushAt + T.crush, () => {
+                $('block').classList.remove('crushed');
+                const unsolved = GENESIS.replace(/^0+/, m => [...m].map(rnd).join(''));
+                $('block').innerHTML = `<div class="row">${spans(unsolved, false)}</div>`;
+            });
+
+            const counterAt = crushAt + T.crush + 40;
+            at(counterAt, () => {
+                const cells = [...$('block').querySelectorAll('span')];
+                const lead = (GENESIS.match(/^0+/) || [''])[0].length;
+                const t0 = performance.now();
+
+                const churn = setInterval(() => {
+                    const p = Math.min(1, (performance.now() - t0) / ms(T.counter));
+                    const n = Math.floor(Math.pow(p, 2.4) * 1000000);
+                    $('cap23').textContent =
+                        `Iteration ${String(n).padStart(7, '0')} / 1000000`;
+                    cells.forEach((c, i) => { if (i >= lead || p < 0.55) c.textContent = rnd(); });
+                    if (p >= 1) clearInterval(churn);
+                }, ms(28));
+                timers.push(churn);
+            });
+
+            const zerosAt = counterAt + T.counter;
+            const lead = (GENESIS.match(/^0+/) || [''])[0].length;
+            for (let z = 0; z < lead; z++) {
+                at(zerosAt + z * T.zeroEvery, () => {
+                    const cells = [...$('block').querySelectorAll('span')];
+                    cells[z].textContent = '0';
+                    cells[z].style.color = 'var(--text-max)';
+                    timers.push(setTimeout(() => {
+                        cells[z].style.color = 'var(--text-faint)';
+                    }, ms(90)));
+                });
+            }
+
+            const settle = zerosAt + lead * T.zeroEvery;
+            at(settle, () => {
+                $('block').innerHTML = `<div class="row">${spans(GENESIS, true)}</div>`;
+                $('cap23').textContent = 'Iteration 1000000 / 1000000 · target met';
+            });
+
+            const foldAt = settle + T.foldIn;
+            const STEPS = [
+                { n: 32, size: 17, track: 0.06 },
+                { n: 16, size: 24, track: 0.10 },
+                { n: 8,  size: 32, track: 0.16 },
+            ];
+
+            STEPS.forEach((st, k) => {
+                at(foldAt + k * T.foldEvery, () => {
+                    if (k === 0) {
+                        $('cap23').textContent = 'Folding';
+                        $('block').classList.add('resolving');
+                    }
+                    const cur = [...$('block').textContent].filter(c => c.trim());
+                    const next = [];
+                    for (let i = 0; i < cur.length; i += 2) {
+                        next.push(Math.random() < 0.5 ? cur[i] : (cur[i + 1] ?? cur[i]));
+                    }
+                    const g = $('block');
+                    g.style.fontSize = st.size + 'px';
+                    g.style.letterSpacing = st.track + 'em';
+                    g.innerHTML = `<div class="row">${next.slice(0, st.n).join('')}</div>`;
+                });
+            });
+
+            const resolveAt = foldAt + STEPS.length * T.foldEvery;
+            at(resolveAt, () => {
+                const target = 'mirstat';
+                const g = $('block');
+                g.style.fontSize = 'clamp(30px, 8.5vw, 44px)';
+                g.style.letterSpacing = '0.22em';
+                $('cap23').textContent = '';
+
+                let it = 0;
+                const iv = setInterval(() => {
+                    const shown = [...target].map((c, i) =>
+                        i < it ? c : HEX[(Math.random() * 16) | 0].toUpperCase()).join('');
+                    g.innerHTML =
+                        `<div class="row"><span class="mid">${shown.slice(0, 3)}</span>${shown.slice(3)}</div>`;
+                    it += 0.5;
+                    if (it >= target.length) {
+                        clearInterval(iv);
+                        g.innerHTML = `<div class="row"><span class="mid">MID</span>STATE</div>`;
+                        $('boot-logo').classList.add('on');
+                        $('cap23').textContent = 'Genesis mirstat';
+                    }
+                }, ms(T.resolve / 18));
+                timers.push(iv);
+            });
+
+            at(resolveAt + T.resolve + T.hold, lift);
+        }
+
+        function lift() {
+            clearAll();
+            curtain.classList.add('lifting');
+            sessionStorage.setItem('mirstat-intro-played', 'true');
+            setTimeout(() => curtain.classList.add('gone'), 440);
+        }
+
+        curtain.addEventListener('click', lift);
+        window.addEventListener('keydown', lift);
+        setTimeout(() => { if (!curtain.classList.contains('gone')) lift(); }, 9000);
+
+        runBootSequence();
+    }
+
+    // --- Diagram Rendering --- //
+    async function renderVisibleDiagrams() {
+        const unrendered = Array.from(document.querySelectorAll('.content-pane.active .mermaid:not([data-processed="true"])'))
+            .filter(el => {
+                const parentTab = el.closest('.tab-content');
+                return !parentTab || parentTab.classList.contains('active');
+            });
+
+        if (unrendered.length > 0) {
+            await mermaid.run({ nodes: unrendered });
+        }
+    }
+
+    // --- Routing & Deep Linking --- //
+    const menuItems = document.querySelectorAll('.menu-item');
+    const panes = document.querySelectorAll('.content-pane');
+    const tabBtns = document.querySelectorAll('.tab-btn');
+
+    // Helper to activate main sidebar sections
+    async function activateSection(targetId) {
+        const item = document.querySelector(`.menu-item[data-target="${targetId}"]`);
+        const pane = document.getElementById(targetId);
+        if (!item || !pane) return false;
+
+        menuItems.forEach(m => m.classList.remove('active'));
+        panes.forEach(p => p.classList.remove('active'));
+
+        item.classList.add('active');
+        pane.classList.add('active');
+        window.scrollTo(0,0);
+
+        await renderVisibleDiagrams();
+        return true;
+    }
+
+    // Helper to activate internal tabs
+    async function activateTab(tabId) {
+        const btn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+        const tab = document.getElementById(tabId);
+        if (!btn || !tab) return false;
+
+        const targetContainer = btn.closest('.tabs');
+        targetContainer.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        targetContainer.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        
+        btn.classList.add('active');
+        tab.classList.add('active');
+
+        await renderVisibleDiagrams();
+        return true;
+    }
+
+    // Read URL Hash and route accordingly
+    async function handleRoute() {
+        let hash = window.location.hash.substring(1);
+        
+        // Default to overview if no hash
+        if (!hash) {
+            await activateSection('overview');
+            return;
+        }
+
+        // Try to load it as a main sidebar section
+        let isSection = await activateSection(hash);
+        
+        // If it wasn't a main section, check if it's an internal sub-tab
+        if (!isSection) {
+            const tab = document.getElementById(hash);
+            if (tab && tab.classList.contains('tab-content')) {
+                const parentPane = tab.closest('.content-pane');
+                if (parentPane) {
+                    // Open the parent section, then switch to the tab
+                    await activateSection(parentPane.id);
+                    await activateTab(hash);
+                    
+                    // Smoothly scroll down to make the tabs visible
+                    const tabsContainer = tab.closest('.tabs');
+                    if (tabsContainer) {
+                        tabsContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                }
+            }
+        }
+    }
+
+   // Bind clicks on sidebar items to update URL and trigger navigation
+    menuItems.forEach(item => {
+        item.addEventListener('click', async () => {
+            const targetId = item.getAttribute('data-target');
+            history.pushState(null, null, '#' + targetId);
+            await activateSection(targetId);
+            
+            // Auto-close mobile menu after clicking a section
+            if (window.innerWidth <= 900) {
+                document.getElementById('sidebar-menu').classList.remove('open');
+            }
+        });
+    });
+
+    // Bind clicks on internal tabs to update URL and trigger navigation
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const tabId = btn.getAttribute('data-tab');
+            history.pushState(null, null, '#' + tabId);
+            await activateTab(tabId);
+        });
+    });
+
+    // Listen for Browser Back/Forward navigation
+    window.addEventListener('popstate', handleRoute);
+
+    // On Initial Load
+    document.addEventListener("DOMContentLoaded", async () => {
+        if (window.location.hash) {
+            await handleRoute();
+        } else {
+            await renderVisibleDiagrams();
+        }
+        setTimeout(initChart, 100);
+    });
+
+    // --- Supply Curve Chart --- //
+    function initChart() {
+        const ctx = document.getElementById('supplyChart');
+        if (!ctx) return;
+
+        const years = Array.from({length: 35}, (_, i) => i);
+        const blocksPerYear = 525600;
+        let currentReward = 1; // 1 gMDS
+        
+        let supplyData = [];
+        let rewardData = [];
+        let circulating = 0;
+
+        for (let i = 0; i < 35; i++) {
+            circulating += currentReward * blocksPerYear;
+            supplyData.push(circulating); // in gMDS
+            rewardData.push(currentReward);
+            currentReward = currentReward / 2;
+        }
+
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        const gridColor = isDark ? '#262626' : '#e3e3e3';
+        const textColor = isDark ? '#9a9a9a' : '#565656';
+        const accent = isDark ? '#f5f5f5' : '#111111';
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: years.map(y => `Year ${y}`),
+                datasets: [
+                    {
+                        label: 'Circulating Supply (gMDS)',
+                        data: supplyData,
+                        borderColor: textColor,
+                        backgroundColor: 'transparent',
+                        borderWidth: 1,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Block Reward (gMDS)',
+                        data: rewardData,
+                        borderColor: accent,
+                        borderDash: [5, 5],
+                        borderWidth: 1,
+                        yAxisID: 'y1'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { labels: { color: textColor, font: { family: "'JetBrains Mono', monospace" } } },
+                    tooltip: { titleFont: { family: "'JetBrains Mono', monospace" }, bodyFont: { family: "'JetBrains Mono', monospace" } }
+                },
+                scales: {
+                    x: {
+                        grid: { color: gridColor },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    },
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: { display: true, text: 'Total Supply (gMDS)', color: textColor },
+                        grid: { color: gridColor },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    },
+                    y1: {
+                        type: 'logarithmic',
+                        display: true,
+                        position: 'right',
+                        title: { display: true, text: 'Block Reward (Log Scale)', color: textColor },
+                        grid: { drawOnChartArea: false },
+                        ticks: { color: textColor, font: { family: "'JetBrains Mono', monospace" } }
+                    }
+                }
+            }
+        });
+    }
+</script>
+</body>
+</html>

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<!--
+    mirstat Chat — LAN-only browser UI.
+
+    Wire contract (mirrors crate::rpc::types::SendChatRequest):
+
+      POST /api/chat
+      Content-Type: application/json
+      Body:
+        {
+          "reply_to": <u64 | null>,
+          "words":    [<u8>, ...],          // 0..=10 indices into CHAT_DICTIONARY
+          "attachments": [                  // 0..=4 entries
+            { "kind": "address", "value": "<64-char lowercase hex>" }
+          ]
+        }
+      Either `words` or `attachments` must be non-empty.
+
+      GET  /api/chat
+      Returns:
+        {
+          "messages": [
+            { sender, timestamp, nonce, reply_to, words, attachments? }
+            ...
+          ],
+          "dictionary": [<string>; 256]
+        }
+      Each message's `attachments` is omitted by the server when empty.
+
+    Bug-fix notes (server-side):
+      - Pre-v2 light-client chats broadcast with random-nonce PoW; this
+        caused remote peers to apply Bayesian Adversarial penalty to the
+        forwarding node. The handler now mines real v2 PoW. See
+        LightRequest::SendChat handler in src/node.rs.
+      - Pre-v2 light-client chats double-pushed history. Fixed by the
+        same handler change.
+-->
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mirstat | Global P2P Chat</title>
+    <script>
+(function(){try{var t=localStorage.getItem('mirstat-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();
+function toggleTheme(){var d=document.documentElement,n=d.getAttribute('data-theme')==='light'?'dark':'light';d.setAttribute('data-theme',n);try{localStorage.setItem('mirstat-theme',n);}catch(e){}}
+</script>
+<link rel="stylesheet" href="/mirstat.css">
+</head>
+<body class="page-chat">
+
+<div class="topbar">
+    <div class="brand"><div class="brand-indicator"></div> mirstat CHAT</div>
+    <div class="nav-actions">
+        <button id="theme-toggle" class="btn theme-toggle" onclick="toggleTheme()" title="Toggle light / dark" aria-label="Toggle theme"><svg class="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg><svg class="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+        <a href="/" class="btn">Explorer</a>
+    </div>
+</div>
+
+<div class="workspace">
+    <!-- Chat Area -->
+    <div class="chat-column">
+        <div>
+            <div class="header-desc">Decentralized P2P message bus. Max 10 words. Click a PeerId to set a local nickname.</div>
+        </div>
+
+        <div id="chat-box"></div>
+
+        <div class="composer">
+            <div id="active-reply">
+                <span id="reply-text" class="mono">Replying to...</span>
+                <button class="btn" style="padding: 2px 8px; font-size: 11px;" onclick="cancelReply()">Cancel</button>
+            </div>
+
+            <div class="draft-container">
+                <div id="draft-words" style="display: flex; gap: 6px; flex-wrap: wrap;"></div>
+                <input type="text" id="chat-input" list="dict-list" placeholder="Type a word..." autocomplete="off">
+            </div>
+            <datalist id="dict-list"></datalist>
+
+            <div id="draft-attachments" style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;"></div>
+
+            <div class="composer-controls">
+                <select id="attachment-type" class="btn" style="padding: 4px 8px; outline: none;">
+                    <option value="address">Address</option>
+                    <option value="coin_id">Coin ID</option>
+                    <option value="mix_id">Mix ID</option>
+                    <option value="commitment">Commitment</option>
+                    <option value="block_hash">Block Hash</option>
+                    <option value="mirstat">mirstat</option>
+                    <option value="data_hash">Data Hash</option>
+                </select>
+                <button class="btn" onclick="attachItemPrompt()">+ Attach</button>
+                <button class="btn" onclick="clearDraft()">Clear</button>
+                <button class="btn btn-primary" onclick="sendChat()" id="send-btn" disabled>Broadcast Message</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dictionary Area -->
+    <div class="dict-column">
+        <div class="dict-header">
+            <h3>Protocol Dictionary</h3>
+        </div>
+        <div id="dictionary-box"></div>
+    </div>
+</div>
+
+<script>
+   let dictionary = [];
+    let draft = [];
+    let draftAttachments = [];  // [{ kind: "address", value: "<64-hex>" }, ...]
+    let knownMessages = 0;
+    let replyingToNonce = null;
+    let myPeerId = null;
+
+    const inputField = document.getElementById('chat-input');
+    const messageMap = new Map();
+
+    function escapeHtml(unsafe) {
+        return String(unsafe ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function getNick(peerId) {
+        return localStorage.getItem('nick_' + peerId) || peerId.substring(0, 16) + '...';
+    }
+
+    function setNick(peerId) {
+        const current = localStorage.getItem('nick_' + peerId) || peerId;
+        const nick = prompt(`Set a local nickname for this peer:\n\n${peerId}`, current === peerId ? "" : current);
+        if (nick !== null) {
+            if (nick.trim() === "") {
+                localStorage.removeItem('nick_' + peerId);
+            } else {
+                localStorage.setItem('nick_' + peerId, nick.trim());
+            }
+            knownMessages = 0;
+            document.getElementById('chat-box').innerHTML = '';
+            fetchChat();
+        }
+    }
+
+    function startReply(nonceStr, sender) {
+        // Parse the safe string back into a JS number
+        replyingToNonce = Number(nonceStr); 
+        const nick = getNick(sender);
+        document.getElementById('reply-text').innerHTML = `Replying to <span style="color:var(--link-color)">${escapeHtml(nick)}</span>`;
+        document.getElementById('active-reply').style.display = 'flex';
+        inputField.focus();
+    }
+
+    function cancelReply() {
+        replyingToNonce = null;
+        document.getElementById('active-reply').style.display = 'none';
+    }
+
+    inputField.addEventListener('keydown', function(e) {
+        if (e.key === ' ' || e.key === 'Enter') {
+            e.preventDefault();
+            const val = this.value.trim().toLowerCase();
+            if (!val && e.key === 'Enter' && draft.length > 0) {
+                sendChat();
+                return;
+            }
+            if (!val) return;
+
+            const idx = dictionary.findIndex(w => w.toLowerCase() === val);
+            if (idx !== -1) {
+                addWord(idx);
+                this.value = '';
+            } else {
+                this.style.color = 'var(--warn-accent)';
+                setTimeout(() => this.style.color = 'var(--text-main)', 300);
+            }
+        } else if (e.key === 'Backspace' && this.value === '') {
+            e.preventDefault();
+            if (draft.length > 0) {
+                draft.pop();
+                renderDraft();
+            }
+        }
+    });
+
+    async function fetchChat() {
+        try {
+            const res = await fetch('/api/chat');
+            const data = await res.json();
+            
+            if (dictionary.length === 0 && data.dictionary) {
+                dictionary = data.dictionary;
+                renderDictionary();
+            }
+
+            if (data.messages && data.messages.length > knownMessages) {
+                data.messages.forEach(m => messageMap.set(m.nonce, m));
+                renderMessages(data.messages.slice(knownMessages));
+                knownMessages = data.messages.length;
+            }
+        } catch (err) {
+            console.error("Failed to fetch chat", err);
+        }
+    }
+
+    function renderDictionary() {
+        const box = document.getElementById('dictionary-box');
+        const datalist = document.getElementById('dict-list');
+        box.innerHTML = '';
+        datalist.innerHTML = '';
+
+        dictionary.forEach((word, index) => {
+            const btn = document.createElement('button');
+            btn.className = 'dict-btn';
+            btn.textContent = word;
+            btn.onclick = () => addWord(index);
+            box.appendChild(btn);
+
+            const opt = document.createElement('option');
+            opt.value = word;
+            datalist.appendChild(opt);
+        });
+        updateButtons();
+    }
+
+    function renderMessages(newMessages) {
+        const box = document.getElementById('chat-box');
+
+        newMessages.forEach(msg => {
+            const date = new Date(msg.timestamp * 1000);
+            const timeStr = date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+            const nick = getNick(msg.sender);
+            const wordsText = msg.words.map(w => dictionary[w] || "???").join(" ");
+
+            const div = document.createElement('div');
+            div.className = 'msg';
+            if (msg.reply_to) div.classList.add('is-reply');
+
+            // Reply context — textContent escapes automatically.
+            if (msg.reply_to) {
+                const parentMsg = messageMap.get(msg.reply_to);
+                if (parentMsg) {
+                    const parentNick = getNick(parentMsg.sender);
+                    const ctx = document.createElement('div');
+                    ctx.className = 'reply-context';
+                    ctx.textContent = `↳ Replying to ${parentNick}`;
+                    div.appendChild(ctx);
+                }
+            }
+
+            // Header.
+            const header = document.createElement('div');
+            header.className = 'msg-header';
+
+            const senderSpan = document.createElement('span');
+            senderSpan.className = 'sender';
+            senderSpan.textContent = nick;          // safe: textContent
+            senderSpan.title = msg.sender;          // safe: attribute setter escapes
+            senderSpan.addEventListener('click', () => setNick(msg.sender));  // safe: no string interpolation
+            header.appendChild(senderSpan);
+
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'time';
+            timeSpan.textContent = timeStr;
+            header.appendChild(timeSpan);
+
+            div.appendChild(header);
+
+            // Words.
+            const wordsDiv = document.createElement('div');
+            wordsDiv.className = 'words';
+            wordsDiv.textContent = wordsText;
+            div.appendChild(wordsDiv);
+
+            if (msg.attachments && msg.attachments.length > 0) {
+                const attBox = document.createElement('div');
+                attBox.className = 'msg-attachments';
+                msg.attachments.forEach(att => {
+                    const chip = document.createElement('div');
+                    chip.className = 'msg-attachment';
+                    chip.title = "Click to copy";
+
+                    const header = document.createElement('div');
+                    header.className = 'msg-attachment-header';
+
+                    const label = document.createElement('span');
+                    label.className = 'msg-attachment-label';
+                    label.textContent = att.kind;
+                    header.appendChild(label);
+
+                    const status = document.createElement('span');
+                    status.className = 'msg-attachment-status';
+                    header.appendChild(status);
+
+                    chip.appendChild(header);
+
+                    const value = document.createElement('div');
+                    value.className = 'msg-attachment-value';
+                    value.textContent = att.value;
+                    chip.appendChild(value);
+
+                    chip.addEventListener('click', () => {
+                        navigator.clipboard.writeText(att.value);
+                        chip.classList.add('copied');
+                        status.textContent = '✓ copied';
+                        setTimeout(() => {
+                            chip.classList.remove('copied');
+                            status.textContent = '';
+                        }, 1000);
+                    });
+
+                    attBox.appendChild(chip);
+                });
+                div.appendChild(attBox);
+            }
+            // Reply button — pass nonce as a real value, no string conversion.
+            const replyBtn = document.createElement('button');
+            replyBtn.className = 'reply-btn';
+            replyBtn.textContent = 'Reply';
+            replyBtn.addEventListener('click', () => startReply(msg.nonce, msg.sender));
+            div.appendChild(replyBtn);
+
+            box.appendChild(div);
+        });
+        box.scrollTop = box.scrollHeight;
+    }
+
+    function addWord(index) {
+        if (draft.length >= 10) return;
+        draft.push(index);
+        inputField.value = '';
+        renderDraft();
+        inputField.focus();
+    }
+
+    function clearDraft() {
+        draft = [];
+        draftAttachments = [];
+        inputField.value = '';
+        renderDraft();
+        renderDraftAttachments();
+        inputField.focus();
+    }
+
+    function renderDraft() {
+        const box = document.getElementById('draft-words');
+        box.innerHTML = '';
+        draft.forEach((wordIndex, arrayIndex) => {
+            const span = document.createElement('div');
+            span.className = 'draft-word';
+            span.textContent = dictionary[wordIndex];
+            span.onclick = () => {
+                draft.splice(arrayIndex, 1);
+                renderDraft();
+                inputField.focus();
+            };
+            box.appendChild(span);
+        });
+        updateButtons();
+    }
+
+    function updateButtons() {
+        const isFull = draft.length >= 10;
+        const isEmpty = draft.length === 0 && draftAttachments.length === 0;
+
+        document.getElementById('send-btn').disabled = isEmpty;
+        inputField.disabled = isFull;
+
+        const dictButtons = document.getElementById('dictionary-box').querySelectorAll('.dict-btn');
+        dictButtons.forEach(btn => btn.disabled = isFull);
+    }
+    function attachItemPrompt() {
+        if (draftAttachments.length >= 4) {
+            alert("Maximum 4 attachments per message.");
+            return;
+        }
+        
+        const kind = document.getElementById('attachment-type').value;
+        const raw = prompt(`Paste a ${kind} (hex):`);
+        if (raw === null) return;
+        const hex = raw.trim().toLowerCase();
+        
+        // Addresses can be 64 (legacy) or 72 (checksummed) hex characters.
+        // All other 32-byte hashes are exactly 64 hex characters.
+        let isValid = false;
+        if (kind === "address") {
+            isValid = /^([0-9a-f]{64}|[0-9a-f]{72})$/i.test(hex);
+        } else {
+            isValid = /^[0-9a-f]{64}$/i.test(hex);
+        }
+
+        if (!isValid) {
+            if (kind === "address") {
+                alert("Invalid address — must be exactly 64 or 72 hex characters.");
+            } else {
+                alert(`Invalid ${kind} — must be exactly 64 hex characters.`);
+            }
+            return;
+        }
+        
+        if (draftAttachments.some(a => a.kind === kind && a.value === hex)) {
+            alert("That item is already attached.");
+            return;
+        }
+        
+        draftAttachments.push({ kind: kind, value: hex });
+        renderDraftAttachments();
+        updateButtons();
+    }
+
+    function renderDraftAttachments() {
+        const box = document.getElementById('draft-attachments');
+        box.innerHTML = '';
+        draftAttachments.forEach((att, i) => {
+            const chip = document.createElement('div');
+            chip.className = 'draft-attachment';
+
+            const header = document.createElement('div');
+            header.className = 'draft-attachment-header';
+
+            const label = document.createElement('span');
+            label.className = 'draft-attachment-label';
+            label.textContent = `📎 ${att.kind}`;
+            header.appendChild(label);
+
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'draft-attachment-remove';
+            removeBtn.textContent = '×';
+            removeBtn.title = 'Remove this attachment';
+            removeBtn.onclick = (e) => {
+                e.stopPropagation();
+                draftAttachments.splice(i, 1);
+                renderDraftAttachments();
+                updateButtons();
+            };
+            header.appendChild(removeBtn);
+
+            chip.appendChild(header);
+
+            const value = document.createElement('div');
+            value.className = 'draft-attachment-value';
+            value.textContent = att.value;
+            chip.appendChild(value);
+
+            box.appendChild(chip);
+        });
+    }
+    async function sendChat() {
+        if (draft.length === 0 && draftAttachments.length === 0) return;
+        if (draft.length > 10) return;
+        if (draftAttachments.length > 4) return;
+
+        const payload = {
+            words: draft,
+            reply_to: replyingToNonce,
+            attachments: draftAttachments,
+        };
+
+        const sendBtn = document.getElementById('send-btn');
+        sendBtn.disabled = true;
+        sendBtn.textContent = "Sending...";
+
+        try {
+            const res = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (res.ok) {
+                clearDraft();
+                cancelReply();
+                fetchChat();
+            } else {
+                const errText = await res.text();
+                if (res.status === 403) {
+                    alert("Blocked by Node Firewall: You can only send messages from the local network.");
+                } else {
+                    try {
+                        const errJson = JSON.parse(errText);
+                        alert("Error: " + (errJson.error || "Unknown error"));
+                    } catch (e) {
+                        alert("Backend Error: " + errText);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Failed to send chat", err);
+            alert("Network request failed. Is the node running?");
+        } finally {
+            sendBtn.textContent = "Broadcast Message";
+            updateButtons();
+        }
+    }
+
+    fetchChat();
+    setInterval(fetchChat, 2000);
+</script>
+</body>
+</html>
