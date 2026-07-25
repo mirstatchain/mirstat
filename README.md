@@ -313,3 +313,7 @@ The binaries will be located in:
 
 ```text
 build\bin\Release\
+
+## License
+
+MIT
