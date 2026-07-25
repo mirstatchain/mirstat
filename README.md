@@ -316,4 +316,4 @@ build\bin\Release\
 
 ## License
 
-MIT
+GNU GENERAL PUBLIC LICENSE
