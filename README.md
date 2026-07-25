@@ -1,8 +1,8 @@
 # Mirstat (MIR)
 
 > **Mirstat (MIR)** is a decentralized, post-quantum-ready peer-to-peer electronic cash system designed for the next generation of digital payments. Combining CPU and GPU mining through independent Proof-of-Work algorithms, Mirstat provides a fair, secure, and decentralized network built for long-term sustainability.
->
-> Unlike many blockchain projects focused on speculation, Mirstat is engineered around the original vision of cryptocurrency: a permissionless financial network where anyone can send value, participate in consensus, and contribute to the security of the ecosystem without relying on centralized institutions.
+
+Unlike many blockchain projects focused on speculation, Mirstat is engineered around the original vision of cryptocurrency: a permissionless financial network where anyone can send value, participate in consensus, and contribute to the security of the ecosystem without relying on centralized institutions.
 
 The protocol leverages a dual Proof-of-Work architecture, allowing both CPU and GPU miners to participate using algorithms specifically optimized for their hardware. This creates a more balanced mining ecosystem while strengthening decentralization and reducing dependence on any single class of mining equipment.
 
