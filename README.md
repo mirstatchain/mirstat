@@ -208,3 +208,108 @@ Mirstat is built around openness, fairness, decentralization, and long-term resi
 | Source Code | Open Source |
 | Mining | CPU + GPU |
 | Security Focus | Post-Quantum Vision |
+
+№ # Quick Start
+
+## Requirements
+
+### Linux
+
+Install the required development packages.
+
+**Ubuntu / Debian**
+
+```bash
+sudo apt update
+
+sudo apt install -y \
+    git \
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    libssl-dev \
+    libboost-all-dev
+```
+
+---
+
+### Windows
+
+Required software:
+
+- Visual Studio 2022 (Desktop development with C++)
+- CMake 3.20+
+- Git
+- Ninja (optional)
+
+---
+
+# Clone Repository
+
+```bash
+git clone https://github.com/<your-org>/mirstat.git
+
+cd mirstat
+```
+
+---
+
+# Build on Linux
+
+Create a build directory:
+
+```bash
+mkdir build
+
+cd build
+```
+
+Configure the project:
+
+```bash
+cmake ..
+```
+
+Compile:
+
+```bash
+cmake --build . -j$(nproc)
+```
+
+The compiled binaries will be available inside the `build/bin/` directory.
+
+---
+
+# Build on Windows
+
+Open **Developer Command Prompt for Visual Studio 2022**.
+
+Clone the repository:
+
+```cmd
+git clone https://github.com/<your-org>/mirstat.git
+
+cd mirstat
+```
+
+Generate the build files:
+
+```cmd
+mkdir build
+
+cd build
+
+cmake .. -A x64
+```
+
+Compile:
+
+```cmd
+cmake --build . --config Release
+```
+
+The binaries will be located in:
+
+```text
+build\bin\Release\
